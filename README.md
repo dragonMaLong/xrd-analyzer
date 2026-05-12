@@ -43,7 +43,7 @@ The conventional Scherrer equation yields only a single mean crystallite size. T
 
 或者用 Git：
 ```bash
-git clone https://github.com/YOUR_USERNAME/xrd-analyzer.git
+git clone https://github.com/dragonMaLong/xrd-analyzer.git
 cd xrd-analyzer
 ```
 
