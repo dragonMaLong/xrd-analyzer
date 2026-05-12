@@ -43,8 +43,8 @@ The conventional Scherrer equation yields only a single mean crystallite size. T
 
 或者用 Git：
 ```bash
-git clone https://github.com/YOUR_USERNAME/xrd-csd-analyzer.git
-cd xrd-csd-analyzer
+git clone https://github.com/YOUR_USERNAME/xrd-analyzer.git
+cd xrd-analyzer
 ```
 
 ### 3. 安装依赖
@@ -126,7 +126,7 @@ $$\min_{f \geq 0}\ \left\|\mathbf{A}f - y\right\|^2 + \alpha^2\left\|\mathbf{L}f
 ## 文件结构 / Repository Structure
 
 ```
-xrd-csd-analyzer/
+xrd-analyzer/
 ├── run.py                      # 启动入口（直接运行这个）
 ├── requirements.txt            # Python 依赖
 ├── LICENSE                     # MIT License
