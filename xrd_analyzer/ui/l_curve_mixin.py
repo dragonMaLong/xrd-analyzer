@@ -53,6 +53,7 @@ class LCurveMixin:
             source   = self.source_var.get()
             lam1, lam2 = WAVELENGTHS.get(source, WAVELENGTHS["Cu"])
             mu_centers = [s.get() for s in self.peak_mu_sliders]
+            inst_fwhm = float(getattr(self, "slider_inst_fwhm").get())
 
             # 截取 + 扣背底
             mask = (
@@ -82,7 +83,10 @@ class LCurveMixin:
             D_range  = np.linspace(d_min, d_max, num_pts)
 
             L_single    = build_regularization_matrix(len(D_range))
-            basis_total, _, _ = build_basis_matrix(x, mu_centers, D_range, lam1, lam2)
+            basis_total, _, _ = build_basis_matrix(
+                x, mu_centers, D_range, lam1, lam2,
+                instrument_fwhm_deg=inst_fwhm,
+            )
 
             # ── 3. 扫描 α（对数空间，50 点）──────────────────────────
             alpha_values   = np.logspace(-2, 4, 50)

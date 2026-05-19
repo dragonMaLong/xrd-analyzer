@@ -53,7 +53,8 @@ def build_regularization_matrix(n_d_points: int) -> np.ndarray:
 
 
 def build_basis_matrix(x, mu_list, D_range, lam1, lam2,
-                        intensity_ratio=INTENSITY_RATIO):
+                        intensity_ratio=INTENSITY_RATIO,
+                        instrument_fwhm_deg=0.0):
     """
     为给定的峰位列表构建完整基函数矩阵，同时返回各峰的 k1/k2 子矩阵。
 
@@ -76,8 +77,14 @@ def build_basis_matrix(x, mu_list, D_range, lam1, lam2,
     for mu in mu_list:
         mu_ka2 = calc_kalpha2_position(mu, lam1, lam2)
 
-        gamma1, m1 = calc_peak_params_numba(mu,     lam1, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX)
-        gamma2, m2 = calc_peak_params_numba(mu_ka2, lam2, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX)
+        gamma1, m1 = calc_peak_params_numba(
+            mu, lam1, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
+            instrument_fwhm_deg,
+        )
+        gamma2, m2 = calc_peak_params_numba(
+            mu_ka2, lam2, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
+            instrument_fwhm_deg,
+        )
 
         pk1 = pearson_vii_numba(x, mu,     gamma1, m1)
         pk2 = pearson_vii_numba(x, mu_ka2, gamma2, m2) * intensity_ratio
@@ -123,7 +130,8 @@ def solve_nnls_regularized(basis_total, y_scaled, L_single, n_peaks, alpha):
 # ---------------------------------------------------------------------------
 
 def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
-                     intensity_ratio=INTENSITY_RATIO):
+                     intensity_ratio=INTENSITY_RATIO,
+                     instrument_fwhm_deg=0.0):
     """
     给定峰位列表，完整执行一次正则化 NNLS 拟合。
 
@@ -135,7 +143,8 @@ def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
     basis_k2_list  : list[ndarray]
     """
     basis_total, basis_k1_list, basis_k2_list = build_basis_matrix(
-        x, mu_list, D_range, lam1, lam2, intensity_ratio
+        x, mu_list, D_range, lam1, lam2, intensity_ratio,
+        instrument_fwhm_deg
     )
     f_total, resid = solve_nnls_regularized(
         basis_total, y_scaled, L_single, len(mu_list), alpha
@@ -150,7 +159,8 @@ def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
 # ---------------------------------------------------------------------------
 
 def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
-                              L_single, D_range, alpha_val):
+                              L_single, D_range, alpha_val,
+                              instrument_fwhm_deg=0.0):
     """
     无 self 版本：供子进程使用的 NNLS 拟合入口。
 
@@ -159,7 +169,8 @@ def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
     precompile_numba_functions()  # 子进程首次调用时触发 JIT 编译
 
     basis_total, _, _ = build_basis_matrix(
-        x, mu_list, D_range, lam1, lam2, intensity_ratio
+        x, mu_list, D_range, lam1, lam2, intensity_ratio,
+        instrument_fwhm_deg
     )
     f_total, resid = solve_nnls_regularized(
         basis_total, y_scaled, L_single, len(mu_list), alpha_val
@@ -171,7 +182,8 @@ def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
 
 def _eval_candidate_for_index(mu_val, base_mu, peak_idx,
                                x, y_scaled, lam1, lam2, intensity_ratio,
-                               L_single, D_range, alpha_val):
+                               L_single, D_range, alpha_val,
+                               instrument_fwhm_deg=0.0):
     """
     将第 peak_idx 个峰的 μ 替换为 mu_val，评估残差。
     供 ProcessPoolExecutor 并行扫描峰位时使用。
@@ -182,6 +194,6 @@ def _eval_candidate_for_index(mu_val, base_mu, peak_idx,
     trial[peak_idx] = mu_val
     loss, _ = _fit_with_mu_list_worker(
         x, y_scaled, trial, lam1, lam2, intensity_ratio,
-        L_single, D_range, alpha_val
+        L_single, D_range, alpha_val, instrument_fwhm_deg
     )
     return loss, mu_val

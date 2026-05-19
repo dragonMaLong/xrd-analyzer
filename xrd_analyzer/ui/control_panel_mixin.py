@@ -145,6 +145,13 @@ class ControlPanelMixin:
         self.slider_alpha.set(1)
         self.slider_alpha.pack(fill=tk.X, padx=5, pady=5)
 
+        self.slider_inst_fwhm = tk.Scale(
+            self.scroll_frame, from_=0.0, to=0.5, orient=tk.HORIZONTAL,
+            label="仪器展宽 FWHM (°2θ)", resolution=0.001, length=200,
+        )
+        self.slider_inst_fwhm.set(0.0)
+        self.slider_inst_fwhm.pack(fill=tk.X, padx=5, pady=5)
+
         ttk.Separator(self.scroll_frame, orient="horizontal").pack(fill="x", pady=10)
 
         # ── X 射线源选择 ─────────────────────────────────────────────

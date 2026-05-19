@@ -64,7 +64,8 @@ def pearson_vii_numba(xvals, mu, gamma, m):
 
 
 @njit(fastmath=True, cache=True)
-def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max):
+def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max,
+                           instrument_fwhm_deg=0.0):
     """
     根据晶粒尺寸数组计算 Pearson VII 的 γ 和 m 参数。
 
@@ -87,6 +88,8 @@ def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max)
     # Scherrer 展宽 → 转换为度
     sigma_rad = 0.9 * wavelength / (D_range * np.cos(theta))
     gamma_deg = sigma_rad * 180.0 / np.pi
+    if instrument_fwhm_deg > 0.0:
+        gamma_deg = np.sqrt(gamma_deg ** 2.0 + instrument_fwhm_deg ** 2.0)
 
     # m 参数：线性插值并钳制到 [0.5, 5.0]
     m = M_ref_min + (D_range - D_ref_max) * slope

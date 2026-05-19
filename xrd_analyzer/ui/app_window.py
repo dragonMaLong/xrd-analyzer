@@ -14,7 +14,6 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 
-from ..core.peak_functions import precompile_numba_functions
 from ..core.fitting import (
     WAVELENGTHS,
     INTENSITY_RATIO,
@@ -23,7 +22,7 @@ from ..core.fitting import (
     _eval_candidate_for_index,      # 子进程函数，必须在顶层可导入
 )
 from ..core.analysis import build_all_peak_info
-from ..io.file_reader import load_txt_file
+from ..io.file_reader import load_file
 from ..utils import resource_path
 
 from .control_panel_mixin import ControlPanelMixin
@@ -76,7 +75,6 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             pass
 
         self._setup_ui()
-        precompile_numba_functions()
 
     # ------------------------------------------------------------------
     # UI 构建（串联各 Mixin）
@@ -114,8 +112,8 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.btn_zone.pack(anchor="n", pady=(0, 6))
 
         self.btn_import = tk.Button(
-            self.btn_zone, text="📂 导入TXT文件", bg="#8B8B8B",
-            command=self.load_txt, **button_style,
+            self.btn_zone, text="📂 导入文件", bg="#8B8B8B",
+            command=self.load_file, **button_style,
         )
         self.btn_import.pack(fill=tk.X, pady=8)
 
@@ -177,20 +175,32 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
     # 数据加载
     # ------------------------------------------------------------------
 
-    def load_txt(self):
-        """打开文件对话框，读取两列 TXT 格式 XRD 数据。"""
-        file_path = filedialog.askopenfilename(filetypes=[("TXT files", "*.txt")])
+    def load_file(self):
+        """打开文件对话框，自动识别 TXT / Bruker RAW / Rigaku RAW 格式。"""
+        file_path = filedialog.askopenfilename(
+            title="选择 XRD 数据文件",
+            filetypes=[
+                ("所有支持的格式", "*.txt *.raw *.RAW"),
+                ("TXT 文本文件",   "*.txt"),
+                ("Bruker/Rigaku RAW", "*.raw *.RAW"),
+                ("所有文件",       "*.*"),
+            ],
+        )
         if not file_path:
             return
         try:
-            x, y, name = load_txt_file(file_path)
+            x, y, name, meta = load_file(file_path)
             self.x_data            = x
             self.y_data            = y
             self.data_loaded       = True
             self.current_file_name = name
+            self.current_metadata  = meta   # 供后续浮窗使用
+            # 把原始文件名单独存入，供信息面板区分"文件名"与"RAW内样品名"
+            meta["file_name"] = os.path.splitext(os.path.basename(file_path))[0]
             self.update_preview(None)
+            self.update_info_panel(meta)    # 刷新底部信息面板
         except Exception as exc:
-            messagebox.showwarning("文件提取错误", f"无法加载文件: {exc}")
+            messagebox.showwarning("文件读取错误", "无法加载文件：\n" + str(exc))
 
     # ------------------------------------------------------------------
     # 计算线程
@@ -258,6 +268,7 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             L_single = build_regularization_matrix(len(self.D_range))
 
             alpha_val = float(self.slider_alpha.get())
+            inst_fwhm = float(getattr(self, "slider_inst_fwhm").get())
 
             # ── 4. 峰位扫描（逐峰并行）──────────────────────────────
             if mode == "fast":
@@ -288,6 +299,7 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 args_common = (
                     tuple(best_mu), i, x, y_scaled, lam1, lam2,
                     INTENSITY_RATIO, L_single, self.D_range, alpha_val,
+                    inst_fwhm,
                 )
 
                 with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -329,6 +341,7 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             resid, f_total, basis_k1_list, basis_k2_list = fit_with_mu_list(
                 x, y_scaled, best_mu, lam1, lam2, L_single,
                 self.D_range, alpha_val,
+                instrument_fwhm_deg=inst_fwhm,
             )
             if f_total is None:
                 self.ui_set(self.progress_var, "拟合失败：解全为零")

@@ -43,6 +43,12 @@ class PlotPanelMixin:
         self.toolbar.pack(side=tk.LEFT, anchor="nw", padx=4, pady=2)
 
         self.canvas_widget = self.canvas.get_tk_widget()
+
+        # ── 信息面板必须在 canvas_widget.pack 之前打包 ──────────────────
+        # Tkinter pack 规则：side=BOTTOM 的控件要先占位，
+        # 否则 expand=True 的 canvas 会把所有空间占满。
+        self._build_info_panel()
+
         self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self.right_frame.update_idletasks()
@@ -269,7 +275,7 @@ class PlotPanelMixin:
         self.axes0.set_xlim(angle_min, angle_max)
         self.axes0.set_title("拟合范围预览")
         self.axes0.set_xlabel("2θ (°)")
-        self.axes0.set_ylabel("强度")
+        self.axes0.set_ylabel("Intensity")
 
         # ── 右下分布图（计算前清空）──────────────────────────────────
         if not self.results_ready:
@@ -345,7 +351,7 @@ class PlotPanelMixin:
             pk_idx = np.argmax(peak_fit - bg)
             self.axes0.text(
                 x[pk_idx], peak_fit[pk_idx],
-                f"峰 {self.active_peak_indices[i] + 1}",
+                f"peak {self.active_peak_indices[i] + 1}",
                 ha="center", va="bottom",
                 color=peak_color, fontsize=9, fontweight="bold",
                 bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
@@ -353,7 +359,7 @@ class PlotPanelMixin:
 
         self.axes0.plot(x, total_fit_curve + bg, "k-", lw=2.5, alpha=0.7, label="总拟合")
         self.axes0.set_xlabel("2θ (°)")
-        self.axes0.set_ylabel("强度")
+        self.axes0.set_ylabel("Intensity")
         self.axes0.set_title("XRD多峰拟合及粒径分解")
         self.axes0.set_xlim(x.min(), x.max())
 
@@ -387,8 +393,8 @@ class PlotPanelMixin:
         gl_fill  = self.axes1.fill_between(
             D_range, global_y_pdf, 0, color="gray", alpha=0.2, zorder=1
         )
-        gl_dummy, = self.axes1.plot([], [], color="black", lw=2.5, label="总分布")
-        lines.append(gl_dummy);  labels.append("总分布")
+        gl_dummy, = self.axes1.plot([], [], color="black", lw=2.5, label="Total Distribution")
+        lines.append(gl_dummy);  labels.append("Total Distribution")
         self.legend_handles["global"]    = gl_dummy
         self.actual_components["global"] = {"line": gl_line, "fills": [gl_fill]}
         self.dist_texts["global"]        = []
@@ -409,7 +415,7 @@ class PlotPanelMixin:
                 D_range, line_y_pdf, 0, color=color, alpha=0.15, zorder=2
             )
 
-            label    = f"峰 {peak_id + 1} 粒径分布"
+            label    = f"peak {peak_id + 1} Particle Size Distribution"
             dummy, = self.axes1.plot([], [], color=color, lw=2, linestyle="-", label=label)
             lines.append(dummy);  labels.append(label)
             self.legend_handles[peak_id]    = dummy
@@ -433,8 +439,8 @@ class PlotPanelMixin:
                 texts.append(txt)
             self.dist_texts[peak_id] = texts
 
-        self.axes1.set_xlabel("晶粒尺寸 (nm)")
-        self.axes1.set_ylabel("体积密度 (Volume Density)")
+        self.axes1.set_xlabel("Particle size (nm)")
+        self.axes1.set_ylabel("Volume Density")
         self.axes1.set_title("晶粒尺寸分布 (总分布 vs 分峰)")
         self.axes1.set_xlim(D_range.min(), D_range.max())
         self.axes1.set_ylim(0, Hc_max * 1.2)
@@ -578,3 +584,188 @@ class PlotPanelMixin:
         self.dragging_peak_index = None
         self.canvas.get_tk_widget().config(cursor="arrow")
         self._refresh_peak_slider_bounds()
+
+
+    # ------------------------------------------------------------------
+    # 文件信息面板
+    # ------------------------------------------------------------------
+
+    def _build_info_panel(self):
+        """在图表画布下方创建灰色背景信息面板（两列布局）。"""
+        import tkinter as tk
+
+        BG   = "#D8D8D8"   # 面板背景：浅灰
+        FG   = "#111111"   # 文字：近黑
+        FG_K = "#444444"   # 键名：中灰
+        FONT_K = ("微软雅黑", 8)
+        FONT_V = ("微软雅黑", 8, "bold")
+        PAD  = 4
+
+        self.info_panel = tk.Frame(
+            self.right_frame, bg=BG, height=72,
+        )
+        self.info_panel.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
+        self.info_panel.pack_propagate(False)
+
+        # 两列容器
+        self._info_col = [
+            tk.Frame(self.info_panel, bg=BG),
+            tk.Frame(self.info_panel, bg=BG),
+        ]
+        self._info_col[0].pack(side=tk.LEFT,  fill=tk.BOTH, expand=True, padx=(8,2), pady=3)
+        self._info_col[1].pack(side=tk.LEFT,  fill=tk.BOTH, expand=True, padx=(2,8), pady=3)
+
+        # 占位提示文字
+        self._info_placeholder = tk.Label(
+            self.info_panel,
+            text="📄 导入文件后，这里将显示测量条件信息",
+            bg=BG, fg="#888888",
+            font=("微软雅黑", 8, "italic"),
+            anchor="w",
+        )
+        self._info_placeholder.place(relx=0.0, rely=0.3, relwidth=1.0)
+
+        self._info_label_refs = []   # 保存所有Label引用，方便清除
+
+    def update_info_panel(self, metadata: dict):
+        """
+        根据 metadata 字典刷新信息面板（3列布局）。
+
+        变更：
+        - 所有标签始终显示，值为空时显示 "—"
+        - 文件名 与 样品名（RAW内记录）分开显示
+        - 日期显示完整时间
+
+        列分工
+        ------
+        左列  — 样品与文件信息（文件名、样品名、日期、格式、操作员）
+        中列  — 扫描条件（靶材、波长、2θ范围、步长、数据点数）
+        右列  — 仪器与光学（仪器型号、探测器、各狭缝、Kβ滤片）
+        """
+        import tkinter as tk
+        import os
+
+        BG     = "#D8D8D8"
+        FG_K   = "#555555"
+        FG_V   = "#111111"
+        FG_V_EMPTY = "#AAAAAA"   # 值为空时的颜色
+        FONT_K = ("微软雅黑", 8)
+        FONT_V = ("微软雅黑", 8, "bold")
+        FONT_V_EMPTY = ("微软雅黑", 8)
+
+        if not metadata:
+            return
+
+        # ── 清除旧内容 ──────────────────────────────────────────────────
+        for w in self._info_label_refs:
+            try: w.destroy()
+            except Exception: pass
+        self._info_label_refs.clear()
+        self._info_placeholder.place_forget()
+
+        # ── 重建3列容器 ─────────────────────────────────────────────────
+        for col in self._info_col:
+            try: col.destroy()
+            except Exception: pass
+        self._info_col = [tk.Frame(self.info_panel, bg=BG) for _ in range(3)]
+        self._info_col[0].pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 2), pady=4)
+        self._info_col[1].pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 2), pady=4)
+        self._info_col[2].pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 8), pady=4)
+        self._info_label_refs.extend(self._info_col)
+
+        fmt = metadata.get("format", "")
+        r   = (metadata.get("ranges") or [{}])[0]
+        start = r.get("start")
+        step  = r.get("step")
+        n_pts = r.get("n_steps")
+        end   = r.get("end") or (
+            round(start + (n_pts - 1) * step, 4)
+            if (start is not None and step and n_pts) else None
+        )
+
+        # 文件名（从 sample_name 推断，通常是原始文件名）
+        raw_sample = metadata.get("sample_name", "")
+        file_name  = metadata.get("file_name", raw_sample)  # app_window 存入
+
+        # ── 列0：样品与文件信息 ─────────────────────────────────────────
+        col0 = [
+            ("文件名",   file_name),
+            ("样品名",   None),          # 始终显示标签，值空时显示"—"
+            ("测量日期", metadata.get("date")),
+            ("文件格式", fmt.replace("_", " ")),
+            ("扫描模式", metadata.get("scan_mode")),
+            ("操作员",   metadata.get("operator")),
+        ]
+        # Rigaku 文件内的样品名（与文件名可能不同）
+        slit_name_in_file = raw_sample if raw_sample and raw_sample != file_name else None
+        col0[1] = ("样品名", slit_name_in_file)
+
+        # ── 列1：扫描条件 ───────────────────────────────────────────────
+        lam1 = metadata.get("wavelength_Ka1")
+        lam2 = metadata.get("wavelength_Ka2")
+        anode = metadata.get("anode_material")
+        range_str = (
+            f"{start:.3f}° → {end:.3f}°"
+            if (start is not None and end is not None) else None
+        )
+        col1 = [
+            ("靶材",     anode),
+            ("λ Kα1",   f"{lam1 * 10:.5f} Å" if lam1 else None),
+            ("λ Kα2",   f"{lam2 * 10:.5f} Å" if lam2 else None),
+            ("2θ 范围",  range_str),
+            ("步长",     f"{step:.5f}°" if step else None),
+            ("数据点数", f"{n_pts}" if n_pts else None),
+        ]
+
+        # ── 列2：仪器与光学配置 ─────────────────────────────────────────
+        col2 = [
+            ("仪器型号",  metadata.get("instrument")),
+            ("仪器半径",  metadata.get("instrument_radius")),
+            ("探测器",    metadata.get("detector")),
+            ("光学配置",  metadata.get("optical_config")),
+            ("发散狭缝",  metadata.get("slit_div")),
+            ("接收狭缝",  metadata.get("slit_receive")),
+            ("Kβ 滤片",  metadata.get("kbeta_filter")),
+            ("仪器序列",  metadata.get("instrument_id")),
+        ]
+
+        # ── 渲染：所有标签都显示，值为空时显示 "—" ─────────────────────
+        col_key_widths = [7, 6, 7]
+
+        for col_idx, (col_data, key_w) in enumerate(
+            zip([col0, col1, col2], col_key_widths)
+        ):
+            col_frame = self._info_col[col_idx]
+            for key, val in col_data:
+                if key is None:
+                    continue
+                val_str   = str(val).strip() if val else None
+                is_empty  = not val_str
+                disp_str  = val_str if val_str else "—"
+
+                row_frame = tk.Frame(col_frame, bg=BG)
+                row_frame.pack(fill=tk.X, pady=0)
+
+                lbl_k = tk.Label(
+                    row_frame, text=f"{key}：",
+                    bg=BG, fg=FG_K, font=FONT_K,
+                    anchor="w", width=key_w,
+                )
+                lbl_k.pack(side=tk.LEFT)
+
+                lbl_v = tk.Label(
+                    row_frame, text=disp_str,
+                    bg=BG,
+                    fg=FG_V_EMPTY if is_empty else FG_V,
+                    font=FONT_V_EMPTY if is_empty else FONT_V,
+                    anchor="w",
+                )
+                lbl_v.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+                self._info_label_refs.extend([row_frame, lbl_k, lbl_v])
+
+        # ── 动态调整面板高度 ─────────────────────────────────────────────
+        max_rows = max(len(col0), len(col1), len(col2))
+        row_h = 27
+        new_h = max(56, max_rows * row_h + 10)
+        self.info_panel.configure(height=new_h)
