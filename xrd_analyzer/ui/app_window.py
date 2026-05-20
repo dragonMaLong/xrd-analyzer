@@ -30,6 +30,10 @@ from .plot_panel_mixin import PlotPanelMixin
 from .l_curve_mixin import LCurveMixin
 
 
+DEFAULT_ANGLE_MIN = 60.0
+DEFAULT_ANGLE_MAX = 74.6
+
+
 class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
     """
     XRD 多峰拟合分析工具主窗口。
@@ -175,6 +179,37 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
     # 数据加载
     # ------------------------------------------------------------------
 
+    def _set_default_import_range_and_peak(self):
+        """Set import defaults and place peak 1 at the strongest point in range."""
+        if not self.data_loaded:
+            return
+
+        angle_min = DEFAULT_ANGLE_MIN
+        angle_max = DEFAULT_ANGLE_MAX
+        self.slider_min.set(angle_min)
+        self.slider_max.set(angle_max)
+        self._refresh_peak_slider_bounds()
+
+        x = np.asarray(self.x_data, dtype=float)
+        y = np.asarray(self.y_data, dtype=float)
+        mask = (
+            np.isfinite(x)
+            & np.isfinite(y)
+            & (x >= angle_min)
+            & (x <= angle_max)
+        )
+        if not np.any(mask):
+            return
+
+        local_x = x[mask]
+        local_y = y[mask]
+        peak_center = float(local_x[int(np.argmax(local_y))])
+
+        for i, peak_idx in enumerate(self.active_peak_indices):
+            if peak_idx == 0 and i < len(self.peak_mu_sliders):
+                self.peak_mu_sliders[i].set(peak_center)
+                break
+
     def load_file(self):
         """打开文件对话框，自动识别 TXT / Bruker RAW / Rigaku RAW 格式。"""
         file_path = filedialog.askopenfilename(
@@ -197,6 +232,7 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.current_metadata  = meta   # 供后续浮窗使用
             # 把原始文件名单独存入，供信息面板区分"文件名"与"RAW内样品名"
             meta["file_name"] = os.path.splitext(os.path.basename(file_path))[0]
+            self._set_default_import_range_and_peak()
             self.update_preview(None)
             self.update_info_panel(meta)    # 刷新底部信息面板
         except Exception as exc:

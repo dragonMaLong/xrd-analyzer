@@ -80,14 +80,14 @@ class ControlPanelMixin:
             self.scroll_frame, from_=0, to=100, orient=tk.HORIZONTAL,
             label="起始角 (2θ)", resolution=0.01, command=self.update_preview,
         )
-        self.slider_min.set(30)
+        self.slider_min.set(60)
         self.slider_min.pack(fill=tk.X, padx=5, pady=5)
 
         self.slider_max = tk.Scale(
             self.scroll_frame, from_=0, to=100, orient=tk.HORIZONTAL,
             label="结束角 (2θ)", resolution=0.01, command=self.update_preview,
         )
-        self.slider_max.set(70)
+        self.slider_max.set(74.6)
         self.slider_max.pack(fill=tk.X, padx=5, pady=5)
 
         ttk.Separator(self.scroll_frame, orient="horizontal").pack(fill="x", pady=10)
