@@ -8,7 +8,7 @@ XRDApp 主类：
 import os
 import csv
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 import numpy as np
 import tkinter as tk
@@ -44,6 +44,23 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
     PlotPanelMixin    — 右侧三联图
     LCurveMixin       — L-Curve 正则化参数分析
     """
+
+    def _stop_process_pool(self, executor, futures=()):
+        """尽快终止正在执行的子进程任务。"""
+        for fut in futures:
+            fut.cancel()
+
+        terminate_workers = getattr(executor, "terminate_workers", None)
+        if terminate_workers is not None:
+            terminate_workers()
+            return
+
+        for proc in getattr(executor, "_processes", {}).values():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        executor.shutdown(wait=False, cancel_futures=True)
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -338,34 +355,48 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                     inst_fwhm,
                 )
 
-                with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                    futs = [
-                        ex.submit(_eval_candidate_for_index, mu, *args_common)
-                        for mu in candidates
-                    ]
-                    for fut in as_completed(futs):
+                ex = ProcessPoolExecutor(max_workers=max_workers)
+                futs = [
+                    ex.submit(_eval_candidate_for_index, mu, *args_common)
+                    for mu in candidates
+                ]
+                pending = set(futs)
+                stopped = False
+                try:
+                    while pending:
                         if self.stop_flag.is_set():
+                            stopped = True
+                            self._stop_process_pool(ex, pending)
                             self.ui_set(self.progress_var, "已停止")
-                            break
-                        try:
-                            loss, mu_val = fut.result()
-                        except Exception:
-                            loss, mu_val = np.inf, None
+                            return
 
-                        done += 1
-                        pct  = int(done * 100 / total)
-                        # ← 通过 after() 在主线程更新进度条（线程安全）
-                        self.ui(lambda p=pct: setattr(self.progress_bar, "value", p)
-                                or self.progress_bar.config(value=p))
-                        self.ui_set(
-                            self.progress_var,
-                            f"扫描峰 {i + 1}/{len(best_mu)}… {pct}%",
+                        finished, pending = wait(
+                            pending, timeout=0.05,
+                            return_when=FIRST_COMPLETED,
                         )
+                        for fut in finished:
+                            try:
+                                loss, mu_val = fut.result()
+                            except Exception:
+                                loss, mu_val = np.inf, None
 
-                        if mu_val is not None and (
-                            best_loss is None or loss < best_loss
-                        ):
-                            best_loss, best_val = loss, mu_val
+                            done += 1
+                            pct  = int(done * 100 / total)
+                            # 通过 after() 在主线程更新进度条（线程安全）
+                            self.ui(lambda p=pct: setattr(self.progress_bar, "value", p)
+                                    or self.progress_bar.config(value=p))
+                            self.ui_set(
+                                self.progress_var,
+                                f"扫描峰 {i + 1}/{len(best_mu)}：{pct}%",
+                            )
+
+                            if mu_val is not None and (
+                                best_loss is None or loss < best_loss
+                            ):
+                                best_loss, best_val = loss, mu_val
+                finally:
+                    if not stopped:
+                        ex.shutdown(wait=False, cancel_futures=True)
 
                 best_mu[i] = best_val
 
@@ -374,11 +405,26 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 return
 
             # ── 5. 最终一次完整拟合 ──────────────────────────────────
-            resid, f_total, basis_k1_list, basis_k2_list = fit_with_mu_list(
+            ex = ProcessPoolExecutor(max_workers=1)
+            fut = ex.submit(
+                fit_with_mu_list,
                 x, y_scaled, best_mu, lam1, lam2, L_single,
                 self.D_range, alpha_val,
                 instrument_fwhm_deg=inst_fwhm,
             )
+            stopped = False
+            try:
+                while not fut.done():
+                    if self.stop_flag.is_set():
+                        stopped = True
+                        self._stop_process_pool(ex, (fut,))
+                        self.ui_set(self.progress_var, "已停止")
+                        return
+                    wait((fut,), timeout=0.05)
+                resid, f_total, basis_k1_list, basis_k2_list = fut.result()
+            finally:
+                if not stopped:
+                    ex.shutdown(wait=False, cancel_futures=True)
             if f_total is None:
                 self.ui_set(self.progress_var, "拟合失败：解全为零")
                 return

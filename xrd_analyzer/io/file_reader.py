@@ -197,13 +197,14 @@ def load_rigaku_ultima(file_path: str) -> tuple:
     #
     # 2θ_start 计算规律（逆向工程确认）：
     #   DteX100 / '0.625'   → 2θ_start = off2958
-    #   DteX250(H) / 其他   → 2θ_start = off2958 × 2 + 1°
+    #   D/teX Ultra / '1 deg.' → 2θ_start = off2958 × 4
+    #   DteX250(H) / 其他      → 2θ_start = off2958 × 2 + 1°
     #
     psd_frame_detected = False
-    det_str = (detector or "").upper().replace(" ", "")
+    det_str = (detector or "").upper().replace(" ", "").replace("/", "")
     ax_str  = (scan_axis or "")
 
-    if "DTEX" in det_str and "ULTRA" not in det_str:
+    if "DTEX" in det_str:
         try:
             n_total_cand = struct.unpack_from("<I", raw, 3154)[0]
             n_extra = n_total_cand - n_steps
@@ -213,7 +214,9 @@ def load_rigaku_ultima(file_path: str) -> tuple:
                 combined = extra_c + main_c
 
                 # 计算 PSD 起始角
-                if "DTEX100" in det_str or "0.625" in ax_str:
+                if "ULTRA" in det_str and "1" in ax_str:
+                    start_psd = theta_start * 4.0
+                elif "DTEX100" in det_str or "0.625" in ax_str:
                     start_psd = theta_start
                 else:
                     start_psd = theta_start * 2.0 + 1.0
