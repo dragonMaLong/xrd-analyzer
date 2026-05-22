@@ -12,6 +12,8 @@ import sys
 import os
 import multiprocessing as mp
 
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 # 确保 xrd_analyzer 包可以被找到
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

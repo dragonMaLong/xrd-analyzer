@@ -261,6 +261,13 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
 
     def compute_thread(self, mode: str = "fine"):
         """在后台线程中启动拟合计算，避免阻塞 UI。"""
+        if not self.data_loaded:
+            messagebox.showwarning("提示", "请先导入数据。")
+            return
+        if not self.peak_mu_sliders:
+            messagebox.showwarning("提示", "请至少选择一个峰。")
+            return
+
         self.stop_flag.clear()
 
         # 显示进度条
@@ -288,6 +295,10 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             source      = self.source_var.get()
             lam1, lam2  = WAVELENGTHS.get(source, WAVELENGTHS["Cu"])
             mu_centers  = [s.get() for s in self.peak_mu_sliders]
+            if not mu_centers:
+                self.ui(messagebox.showwarning, "提示", "请至少选择一个峰。")
+                self.ui_set(self.progress_var, "计算失败")
+                return
 
             # ── 2. 截取并预处理数据 ──────────────────────────────────
             mask  = (
@@ -296,6 +307,10 @@ class XRDApp(ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             )
             x     = self.x_data[mask]
             y_raw = self.y_data[mask]
+            if len(x) < 2:
+                self.ui(messagebox.showwarning, "提示", "当前角度范围内没有足够的数据点。")
+                self.ui_set(self.progress_var, "计算失败")
+                return
 
             bg_indices = np.where(
                 (x < self.slider_min.get() + 0.5)

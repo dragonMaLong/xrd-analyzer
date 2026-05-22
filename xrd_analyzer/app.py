@@ -17,6 +17,8 @@ app.py
 import sys
 import os
 
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 # ── 路径修正 ─────────────────────────────────────────────────────────────
 # 本文件在 xrd_analyzer/ 内部，直接运行时 Python 不会把父目录加入 sys.path。
 # 手动插入，使 "from xrd_analyzer.xxx import ..." 在任何运行方式下都有效。
@@ -67,7 +69,25 @@ def main():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_closing)
-    root.mainloop()
+    interrupt_count = 0
+    while True:
+        try:
+            root.mainloop()
+            break
+        except KeyboardInterrupt:
+            interrupt_count += 1
+            try:
+                alive = bool(root.winfo_exists())
+            except tk.TclError:
+                alive = False
+
+            if not alive:
+                break
+            if interrupt_count >= 2:
+                on_closing()
+                break
+
+            print("Ignored one startup interrupt. Close the GUI window or press Ctrl+C again to exit.")
 
 
 if __name__ == "__main__":
