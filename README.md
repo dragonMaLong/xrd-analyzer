@@ -47,7 +47,7 @@ This tool extracts the **crystallite/domain size distribution encoded in XRD lin
 
 ### 1. 安装 Python
 
-推荐下载安装 [Anaconda](https://www.anaconda.com/download)，已包含大部分依赖库。
+推荐下载安装 [Anaconda](https://www.anaconda.com/download) 或 Miniconda。本程序包含较多矩阵运算，使用 conda 默认的 NumPy/SciPy 通常会调用 Intel MKL，计算速度明显快于某些普通 pip 环境。
 
 ### 2. 下载本工具
 
@@ -59,13 +59,22 @@ git clone https://github.com/dragonMaLong/xrd-analyzer.git
 cd xrd-analyzer
 ```
 
-### 3. 安装依赖
+### 3. 安装依赖（推荐 conda / MKL）
 
 打开终端（Windows 推荐用 Anaconda Prompt），进入解压后的文件夹：
 
 ```bash
+conda env create -f environment.yml
+conda activate xrd-analyzer
+```
+
+如果不使用 conda，也可以用 pip 安装依赖：
+
+```bash
 pip install -r requirements.txt
 ```
+
+> 性能提示：如果使用 pip 安装的 NumPy/SciPy 没有链接到 MKL 或高性能 OpenBLAS，精细计算和 L-Curve 分析可能会明显变慢。建议优先使用上面的 conda 环境。
 
 ### 4. 运行程序
 
@@ -144,6 +153,7 @@ $$\min_{f \geq 0}\ \left\|\mathbf{A}f - y\right\|^2 + \alpha^2\left\|\mathbf{L}f
 ```
 xrd-analyzer/
 ├── run.py                      # 启动入口（直接运行这个）
+├── environment.yml             # 推荐 conda 环境（含 MKL）
 ├── requirements.txt            # Python 依赖
 ├── LICENSE                     # MIT License
 ├── README.md                   # 本文件

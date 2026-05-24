@@ -1,0 +1,12 @@
+name: xrd-analyzer
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - numba>=0.57
+  - mkl
+  - mkl-service
+  - pip
