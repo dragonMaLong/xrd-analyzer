@@ -10,14 +10,24 @@
 
 The conventional Scherrer equation yields only a single mean crystallite size. This tool reformulates XRD line-profile analysis as a **regularized inverse problem**: it extracts the full **Crystallite Size Distribution (CSD)** directly from XRD data via Non-Negative Least Squares (NNLS) with Tikhonov regularization, without assuming a priori distribution shape.
 
-### 与其他方法的类比 / Analogy to Other Fields
+### 与常用粒径/晶粒尺寸表征方法的关系 / Comparison with Common Methods
 
-| 领域 Field | 信号 Signal | 核函数 Kernel | 提取量 Output |
+本工具关注的是 **XRD 衍射峰展宽中包含的晶粒尺寸分布信息**。它并不是替代 SAXS、DLS、激光粒度或 TEM，而是补充这些方法：这些技术通常测量颗粒、团聚体或投影尺寸，而 XRD 对相干衍射晶畴（crystallite/domain）更敏感。因此，对于 Pt/C 等纳米催化剂，本工具更适合回答“晶粒尺寸如何分布、不同衍射峰给出的晶畴信息是否一致”这类问题。
+
+This tool extracts the **crystallite/domain size distribution encoded in XRD line broadening**. It is complementary to SAXS, DLS, laser diffraction, and TEM: those methods usually probe particles, aggregates, or projected sizes, whereas XRD is sensitive to coherent crystalline domains.
+
+| 方法 Method | 主要测量对象 Main quantity | 优点 Strengths | 局限性 / 与本工具的区别 Limitations / Difference |
 |---|---|---|---|
-| **本工具 This work** | 衍射强度 vs 2θ | Pearson VII | 晶粒尺寸分布 CSD |
-| DRT 阻抗谱 | 阻抗 vs 频率 | RC 传递函数 | 时间常数分布 |
-| NLDFT-BET | 吸附量 vs 相对压力 | 孔内等温线 | 孔径分布 |
-| 激光粒度（Mie 散射） | 散射强度 vs 角度 | Mie 散射矩阵 | 粒径分布 |
+| Scherrer 方程 | 单一平均晶粒尺寸 | 简单、快速、适合粗略估算 | 只给出一个平均值，不能解析尺寸分布；对峰形、背景、仪器展宽和峰重叠较敏感 |
+| Williamson-Hall / 传统线宽分析 | 平均尺寸与微应变趋势 | 可区分部分尺寸展宽与应变展宽 | 通常仍输出平均参数，难以恢复非单峰或宽分布的 CSD |
+| FormFit / Whole-powder-pattern XRD 方法 | 基于假设模型的晶粒尺寸/形貌参数 | 能利用完整谱图和结构模型，物理约束强 | 通常需要预设粒子形状、尺寸分布或结构模型；模型不匹配时结果会偏倚 |
+| SAXS | 纳米颗粒/孔结构的散射尺寸分布 | 对 1-100 nm 结构敏感，统计性好 | 需要电子密度对比和形状模型；结果常对应颗粒或聚集体，不一定等同于晶粒 |
+| DLS | 溶液中的水合动力学粒径 | 快速、原位、适合分散液 | 强度加权，偏向大颗粒/团聚体；不适用于干粉或负载催化剂晶畴分析 |
+| 激光粒度 | 微米级颗粒/团聚体粒径 | 测量范围宽，适合粉体与浆料 | 对纳米晶粒不敏感；结果通常是颗粒或团聚体尺寸，不是晶畴尺寸 |
+| TEM | 投影颗粒尺寸与形貌 | 可直接观察形貌、分散状态和局部结构 | 视野有限、统计量依赖采样和图像分割；测得的是投影颗粒尺寸，不一定是相干晶畴 |
+| **本工具** | XRD 峰形反演得到的晶粒尺寸分布 CSD | 不预设分布函数，可多峰联合拟合，并用正则化稳定反演 | 结果仍依赖峰选择、背景处理、仪器展宽校正和“峰展宽主要来自尺寸效应”的假设；微应变/缺陷展宽可能需要额外建模 |
+
+简言之：SAXS/DLS/激光粒度/TEM 更偏向“颗粒或团聚体有多大”，传统 XRD 方法多给“平均晶粒多大”，而本工具尝试从 XRD 峰形中恢复“晶粒尺寸如何分布”。
 
 ---
 
@@ -26,6 +36,8 @@ The conventional Scherrer equation yields only a single mean crystallite size. T
 - **多峰联合拟合**：同时处理多个衍射峰（如 Pt 的 111、200、220、311），约束更强、结果更可靠
 - **Kα₂ 双线分离**：自动计算并分离 Cu/Co/Fe/Mo 靶的 Kα₂ 贡献
 - **L-Curve 自动选参**：自动扫描正则化参数 α，用最大曲率法定位最优拐点
+- **仪器展宽修正入口**：可设置仪器展宽 FWHM（°2θ），用于减弱仪器分辨率对尺寸反演的影响
+- **RAW/TXT 自动读取**：支持两列 TXT、Bruker RAW（v1/v3/v4）以及 Rigaku RAW/Ultima 数据
 - **图例交互**：点击图例可显示/隐藏各峰的分布曲线
 - **CSV 导出**：一键导出粒径分布和拟合曲线数据
 
@@ -43,8 +55,8 @@ The conventional Scherrer equation yields only a single mean crystallite size. T
 
 或者用 Git：
 ```bash
-git clone https://github.com/YOUR_USERNAME/xrd-csd-analyzer.git
-cd xrd-csd-analyzer
+git clone https://github.com/dragonMaLong/xrd-analyzer.git
+cd xrd-analyzer
 ```
 
 ### 3. 安装依赖
@@ -65,7 +77,11 @@ python run.py
 
 ## 数据格式 / Data Format
 
-程序支持两列 TXT 文件，**第一行为样品名称**，之后每行为 `2θ（°）  强度`：
+程序可自动识别以下 XRD 数据格式：
+
+- 两列 TXT：**第一行为样品名称**，之后每行为 `2θ（°）  强度`
+- Bruker RAW：v1、v3（RAW1.01）、v4（RAW4.00）
+- Rigaku RAW：ASCII `.raw` 以及 Ultima IV / RINT 二进制格式
 
 ```
 Pt-C-sample-01
@@ -80,13 +96,13 @@ Pt-C-sample-01
 ## 使用步骤 / Workflow
 
 ```
-1. 点击「导入 TXT 文件」加载数据
+1. 点击「导入文件」加载 TXT 或 RAW 数据
         ↓
 2. 用左侧滑块设置分析角度范围（蓝色虚线）
         ↓
 3. 勾选需要分析的峰，拖动峰位标记到对应峰中心
         ↓
-4. （可选）点击「L-Curve 分析」自动选择最优平滑因子 α
+4. 设置粒径范围、平滑因子 α 和仪器展宽 FWHM；必要时点击「L-Curve 分析」自动选择 α
         ↓
 5. 点击「极速计算」（快速预览）或「精细计算」（推荐）
         ↓
@@ -119,14 +135,14 @@ $$I(2\theta) = \int_0^\infty f(D)\,p(2\theta;\,D,\mu)\,\mathrm{d}D + \text{backg
 
 $$\min_{f \geq 0}\ \left\|\mathbf{A}f - y\right\|^2 + \alpha^2\left\|\mathbf{L}f\right\|^2$$
 
-其中 $\mathbf{L}$ 为一阶差分矩阵（Tikhonov 正则化），$\alpha$ 为正则化参数（由 L-Curve 自动确定）。
+其中 $\mathbf{L}$ 为一阶差分矩阵（Tikhonov 正则化），$\alpha$ 为正则化参数（可手动设置，也可由 L-Curve 自动确定）。程序还提供仪器展宽 FWHM 参数，用于在峰形核函数中考虑仪器分辨率贡献。
 
 ---
 
 ## 文件结构 / Repository Structure
 
 ```
-xrd-csd-analyzer/
+xrd-analyzer/
 ├── run.py                      # 启动入口（直接运行这个）
 ├── requirements.txt            # Python 依赖
 ├── LICENSE                     # MIT License
@@ -142,7 +158,7 @@ xrd-csd-analyzer/
     │   └── analysis.py         # 分布后处理
     │
     ├── io/                     # 文件读写
-    │   └── file_reader.py      # TXT 读取
+    │   └── file_reader.py      # TXT/RAW 自动识别与读取
     │
     └── ui/                     # 界面层
         ├── app_window.py       # 主窗口
