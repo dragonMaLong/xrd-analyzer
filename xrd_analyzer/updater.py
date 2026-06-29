@@ -22,7 +22,8 @@ class UpdateDownloadError(RuntimeError):
 
 def download_update(info: UpdateInfo, *, progress_callback: ProgressCallback | None = None) -> Path:
     url = (info.download_url or "").strip()
-    if not url:
+    part_urls = tuple(part.strip() for part in getattr(info, "download_parts", ()) if str(part).strip())
+    if not url and not part_urls:
         raise UpdateDownloadError("更新信息中没有可下载的安装包链接。")
 
     download_dir = _download_dir()
@@ -40,28 +41,38 @@ def download_update(info: UpdateInfo, *, progress_callback: ProgressCallback | N
     if partial.exists():
         partial.unlink()
 
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/octet-stream, */*",
-            "User-Agent": f"XRD-Analyzer-Updater/{info.current_version}",
-        },
-    )
+    urls = part_urls or (url,)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            total = int(response.headers.get("Content-Length") or 0)
-            digest = hashlib.sha256()
-            downloaded = 0
-            with partial.open("wb") as handle:
-                while True:
-                    chunk = response.read(1024 * 256)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    downloaded += len(chunk)
-                    if progress_callback is not None:
-                        progress_callback(downloaded, total)
+        digest = hashlib.sha256()
+        downloaded = 0
+        with partial.open("wb") as handle:
+            for index, item_url in enumerate(urls, start=1):
+                request = urllib.request.Request(
+                    item_url,
+                    headers={
+                        "Accept": "application/octet-stream, */*",
+                        "User-Agent": f"XRD-Analyzer-Updater/{info.current_version}",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    part_total = int(response.headers.get("Content-Length") or 0)
+                    progress_total = part_total if len(urls) == 1 else 0
+                    if progress_callback is not None and len(urls) > 1:
+                        progress_callback(downloaded, 0)
+
+                    expected_part = _part_index_from_url(item_url)
+                    if expected_part is not None and expected_part != index:
+                        raise UpdateDownloadError("更新分片顺序不正确，请重新检查更新清单。")
+
+                    while True:
+                        chunk = response.read(1024 * 256)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback is not None:
+                            progress_callback(downloaded, progress_total)
     except urllib.error.HTTPError as exc:
         _remove_quietly(partial)
         raise UpdateDownloadError(f"下载安装包失败：服务器返回 HTTP {exc.code}。") from exc
@@ -72,6 +83,9 @@ def download_update(info: UpdateInfo, *, progress_callback: ProgressCallback | N
     except TimeoutError as exc:
         _remove_quietly(partial)
         raise UpdateDownloadError("下载安装包失败：连接超时。") from exc
+    except UpdateDownloadError:
+        _remove_quietly(partial)
+        raise
     except OSError as exc:
         _remove_quietly(partial)
         raise UpdateDownloadError(f"下载安装包失败：{exc}") from exc
@@ -116,6 +130,16 @@ def _download_filename(info: UpdateInfo) -> str:
     suffix = Path(raw_name).suffix or ".exe"
     version = re.sub(r"[^0-9A-Za-z._-]+", "_", info.latest_version or "update")
     return f"XRD-Analyzer-v{version}{suffix}"
+
+
+def _part_index_from_url(url: str) -> int | None:
+    match = re.search(r"\.part(\d+)(?:$|[?#])", str(url), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
 def _sha256_file(path: Path) -> str:

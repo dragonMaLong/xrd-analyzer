@@ -12,7 +12,7 @@ from .version import __version__
 
 DEFAULT_UPDATE_REPOSITORY = "dragonMaLong/xrd-analyzer"
 DEFAULT_GITEE_MANIFEST_URL = (
-    "https://gitee.com/dragonMalong/xrd-analyzer/raw/main/updates/latest.json"
+    "https://gitee.com/dragonMalong/xrd-analyzer/raw/master/updates/latest.json"
 )
 DEFAULT_GITHUB_MANIFEST_URL = (
     "https://raw.githubusercontent.com/dragonMaLong/xrd-analyzer/main/updates/latest.json"
@@ -38,6 +38,7 @@ class UpdateInfo:
     source_name: str = ""
     source_url: str = ""
     sha256: str = ""
+    download_parts: tuple[str, ...] = ()
 
 
 class UpdateCheckError(RuntimeError):
@@ -131,6 +132,14 @@ def _info_from_manifest(payload: dict[str, Any], current_version: str, source_ur
             legacy_keys=("download_url", "browser_download_url"),
         ),
     )
+    download_parts = _manifest_list(
+        payload,
+        _manifest_keys(
+            source_prefix,
+            "download_parts",
+            legacy_keys=("download_parts",),
+        ),
+    )
     asset_name = str(payload.get("asset_name") or "").strip()
     if not asset_name and download_url:
         asset_name = download_url.rstrip("/").rsplit("/", 1)[-1]
@@ -148,6 +157,7 @@ def _info_from_manifest(payload: dict[str, Any], current_version: str, source_ur
         source_name=str(payload.get(f"{source_prefix}_source_name") or detected_source or payload.get("source_name") or "").strip(),
         source_url=source_url,
         sha256=str(payload.get("sha256") or payload.get("checksum") or "").strip(),
+        download_parts=download_parts,
     )
 
 
@@ -163,6 +173,18 @@ def _first_manifest_value(payload: dict[str, Any], keys: Iterable[str]) -> str:
         if value:
             return value
     return ""
+
+
+def _manifest_list(payload: dict[str, Any], keys: Iterable[str]) -> tuple[str, ...]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            items = [str(item or "").strip() for item in value]
+            return tuple(item for item in items if item)
+        if isinstance(value, str) and value.strip():
+            items = re.split(r"[\r\n,]+", value)
+            return tuple(item.strip() for item in items if item.strip())
+    return ()
 
 
 def _info_from_github_release(payload: dict[str, Any], current_version: str, repository: str) -> UpdateInfo:

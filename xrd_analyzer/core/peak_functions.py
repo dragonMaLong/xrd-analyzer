@@ -1,15 +1,11 @@
 """
 core/peak_functions.py
 ----------------------
-Numba 加速的核心峰形计算函数，以及 Kα2 峰位计算。
+NumPy 向量化的核心峰形计算函数，以及 Kα2 峰位计算。
 
 所有函数均为纯函数（无副作用），可在主进程和子进程中安全调用。
 """
 import numpy as np
-import sys
-from numba import njit, prange
-
-NUMBA_CACHE = not getattr(sys, "frozen", False)
 
 
 # ---------------------------------------------------------------------------
@@ -36,10 +32,9 @@ SLOPE_M: float = (5.0 - M_REF_MIN) / (0.5 - D_REF_MAX)  # ≈ -0.04523
 
 
 # ---------------------------------------------------------------------------
-# Numba JIT 核函数
+# 向量化核函数
 # ---------------------------------------------------------------------------
 
-@njit(fastmath=True, parallel=True, cache=NUMBA_CACHE)
 def pearson_vii_numba(xvals, mu, gamma, m):
     """
     计算 Pearson VII 峰形矩阵。
@@ -56,17 +51,12 @@ def pearson_vii_numba(xvals, mu, gamma, m):
     out : 2-D array, shape (N, P)
         out[i, j] = (1 + ((xvals[i] - mu) / gamma[j])²)^(-m[j])
     """
-    out = np.empty((xvals.shape[0], gamma.shape[0]))
-    for i in prange(xvals.shape[0]):
-        xi = xvals[i]
-        for j in range(gamma.shape[0]):
-            g  = gamma[j]
-            mj = m[j]
-            out[i, j] = (1.0 + ((xi - mu) / g) ** 2.0) ** (-mj)
-    return out
+    x = np.asarray(xvals, dtype=float)[:, None]
+    gamma_arr = np.asarray(gamma, dtype=float)[None, :]
+    m_arr = np.asarray(m, dtype=float)[None, :]
+    return (1.0 + ((x - mu) / gamma_arr) ** 2.0) ** (-m_arr)
 
 
-@njit(fastmath=True, cache=NUMBA_CACHE)
 def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max,
                            instrument_fwhm_deg=0.0):
     """
@@ -95,12 +85,7 @@ def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max,
         gamma_deg = np.sqrt(gamma_deg ** 2.0 + instrument_fwhm_deg ** 2.0)
 
     # m 参数：线性插值并钳制到 [0.5, 5.0]
-    m = M_ref_min + (D_range - D_ref_max) * slope
-    for i in range(m.shape[0]):
-        if m[i] < 0.5:
-            m[i] = 0.5
-        elif m[i] > 5.0:
-            m[i] = 5.0
+    m = np.clip(M_ref_min + (D_range - D_ref_max) * slope, 0.5, 5.0)
 
     # Pearson VII γ 与 FWHM 的换算
     gamma_vii = gamma_deg / (2.0 * np.sqrt(2.0 ** (1.0 / m) - 1.0))
@@ -131,8 +116,8 @@ def calc_kalpha2_position(mu_kalpha1: float, lam1: float, lam2: float) -> float:
 
 def precompile_numba_functions() -> None:
     """
-    触发 Numba JIT 预编译，消除首次调用时的延迟。
-    在程序启动阶段调用一次即可。
+    兼容旧调用路径的预热函数。
+    当前实现已改为 NumPy 向量化，不再引入 Numba/llvmlite 打包依赖。
     """
     try:
         dummy_x = np.linspace(58.0, 74.0, 100)
@@ -142,4 +127,4 @@ def precompile_numba_functions() -> None:
         )
         _ = pearson_vii_numba(dummy_x, 68.0, gamma, m)
     except Exception as exc:
-        print(f"[Numba] 预编译失败（首次运行可能稍慢）: {exc}")
+        print(f"[Peak] 峰形函数预热失败: {exc}")

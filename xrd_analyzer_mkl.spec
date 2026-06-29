@@ -7,7 +7,7 @@ PROJECT_DIR = Path(SPECPATH)
 APP_NAME = "XRD-Analyzer"
 
 datas = []
-for asset_name in ("logo.ico", "xrd_analyzer/XRD-logo.png"):
+for asset_name in ("logo.ico",):
     asset_path = PROJECT_DIR / asset_name
     if asset_path.exists():
         target = "." if asset_path.parent == PROJECT_DIR else str(asset_path.parent.relative_to(PROJECT_DIR))
@@ -23,7 +23,6 @@ hiddenimports = [
     "scipy._lib.messagestream",
     "scipy.linalg.cython_blas",
     "scipy.linalg.cython_lapack",
-    "numba.cloudpickle.cloudpickle_fast",
 ]
 
 excludes = [
@@ -71,6 +70,8 @@ excludes = [
     "mpl_toolkits",
     "nbclassic",
     "numexpr",
+    "numba",
+    "llvmlite",
     "onnxruntime",
     "openpyxl",
     "pandas",
@@ -154,6 +155,17 @@ def _drop_unused_mkl(toc):
         "omptarget.rtl.level0.dll",
         "omptarget.rtl.opencl.dll",
         "omptarget.sycl.wrap.dll",
+        "opengl32sw.dll",
+        "qt5pdf_conda.dll",
+        "qt5quick_conda.dll",
+        "qt5qml_conda.dll",
+        "qt5qmlmodels_conda.dll",
+        "qt5qmlworkerscript_conda.dll",
+        "qt5virtualkeyboard_conda.dll",
+        "qdirect2d.dll",
+        "qminimal.dll",
+        "tcl86t.dll",
+        "tk86t.dll",
     }
     filtered = []
     for item in toc:
@@ -171,7 +183,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    hooksconfig={"matplotlib": {"backends": ["Qt5Agg"]}},
+    hooksconfig={},
     runtime_hooks=[],
     excludes=excludes,
     noarchive=False,
