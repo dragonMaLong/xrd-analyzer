@@ -104,6 +104,8 @@ Pt-C-sample-01
 
 ## 使用步骤 / Workflow
 
+如果是第一次使用，建议先看这份更通俗的教程：[USER_GUIDE.md](USER_GUIDE.md)。
+
 ```
 1. 点击「导入文件」加载 TXT 或 RAW 数据
         ↓

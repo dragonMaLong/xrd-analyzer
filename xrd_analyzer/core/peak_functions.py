@@ -6,7 +6,10 @@ Numba 加速的核心峰形计算函数，以及 Kα2 峰位计算。
 所有函数均为纯函数（无副作用），可在主进程和子进程中安全调用。
 """
 import numpy as np
+import sys
 from numba import njit, prange
+
+NUMBA_CACHE = not getattr(sys, "frozen", False)
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +39,7 @@ SLOPE_M: float = (5.0 - M_REF_MIN) / (0.5 - D_REF_MAX)  # ≈ -0.04523
 # Numba JIT 核函数
 # ---------------------------------------------------------------------------
 
-@njit(fastmath=True, parallel=True, cache=True)
+@njit(fastmath=True, parallel=True, cache=NUMBA_CACHE)
 def pearson_vii_numba(xvals, mu, gamma, m):
     """
     计算 Pearson VII 峰形矩阵。
@@ -63,7 +66,7 @@ def pearson_vii_numba(xvals, mu, gamma, m):
     return out
 
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=NUMBA_CACHE)
 def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max,
                            instrument_fwhm_deg=0.0):
     """

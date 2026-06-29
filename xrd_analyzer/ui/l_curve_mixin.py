@@ -1,114 +1,131 @@
 """
 ui/l_curve_mixin.py
 --------------------
-L-Curve 正则化参数自动分析 Mixin：
-  - 扫描一系列 α 值，计算残差范数与解的粗糙度范数
-  - 最大曲率法（点到端点直线的最远距离）定位拐点
-  - 弹出独立窗口展示 L-Curve，并提供一键应用推荐 α
+PyQt5 L-Curve 正则化参数自动分析 Mixin。
 """
 import threading
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from tkinter import messagebox
-import tkinter as tk
 
-from ..core.peak_functions import (
-    calc_kalpha2_position,
-    precompile_numba_functions,
-    SLOPE_M, M_REF_MIN, D_REF_MAX,
-)
+import numpy as np
+import pyqtgraph as pg
+from PyQt5.QtWidgets import QDialog, QPushButton, QVBoxLayout
+
 from ..core.fitting import (
     WAVELENGTHS,
     build_basis_matrix,
     build_regularization_matrix,
     solve_nnls_regularized,
 )
+from .qt_controls import MessageBoxAdapter as messagebox
 
 
 class LCurveMixin:
     """L-Curve 分析的所有方法。"""
 
-    # ------------------------------------------------------------------
-    # 线程入口
-    # ------------------------------------------------------------------
+    def _collect_l_curve_params(self):
+        angle_min = self.slider_min.get()
+        angle_max = self.slider_max.get()
+        fit_peak_indices = self._selected_peak_indices_in_fit_range(angle_min, angle_max)
+        return {
+            "source": self.source_var.get(),
+            "mu_centers": [self.peak_mu_sliders[i].get() for i in fit_peak_indices],
+            "angle_min": angle_min,
+            "angle_max": angle_max,
+            "d_min": float(getattr(self, "particle_size_min", 0.5)),
+            "d_max": float(getattr(self, "particle_size_max", 100.0)),
+            "instrument_fwhm": float(getattr(self, "instrument_fwhm", 0.0)),
+            "baseline_state": self._current_manual_baseline_state(),
+        }
 
     def run_l_curve_thread(self):
         """启动 L-Curve 计算线程，防止卡死 UI。"""
         if not self.data_loaded:
             messagebox.showwarning("提示", "请先导入数据！")
             return
-        self.btn_lcurve.config(state=tk.DISABLED)
+        if not self.active_peak_indices:
+            messagebox.showwarning("提示", "请至少选择一个峰。")
+            return
+        params = self._collect_l_curve_params()
+        if not params["mu_centers"]:
+            messagebox.showwarning("提示", "当前蓝色拟合范围内没有峰，请先在范围内添加或移动峰。")
+            return
+        self.btn_lcurve.setEnabled(False)
         self.ui_set(self.progress_var, "正在进行 L-Curve 扫描...")
-        threading.Thread(target=self.compute_l_curve, daemon=True).start()
+        self.progress_label.show()
+        self.progress_bar.show()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        threading.Thread(target=self.compute_l_curve, args=(params,), daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # 核心计算
-    # ------------------------------------------------------------------
-
-    def compute_l_curve(self):
+    def compute_l_curve(self, params):
         """执行 α 扫描，寻找 L-Curve 拐点（最大曲率法）。"""
         try:
-            # ── 1. 准备参数 ─────────────────────────────────────────
-            source   = self.source_var.get()
+            source = params["source"]
             lam1, lam2 = WAVELENGTHS.get(source, WAVELENGTHS["Cu"])
-            mu_centers = [s.get() for s in self.peak_mu_sliders]
-            inst_fwhm = float(getattr(self, "slider_inst_fwhm").get())
+            mu_centers = list(params["mu_centers"])
+            inst_fwhm = float(params["instrument_fwhm"])
+            angle_min = params["angle_min"]
+            angle_max = params["angle_max"]
 
-            # 截取 + 扣背底
-            mask = (
-                (self.x_data >= self.slider_min.get())
-                & (self.x_data <= self.slider_max.get())
-            )
-            x     = self.x_data[mask]
+            mask = (self.x_data >= angle_min) & (self.x_data <= angle_max)
+            x = self.x_data[mask]
             y_raw = self.y_data[mask]
+            if len(x) < 2:
+                self.ui(messagebox.showwarning, "提示", "当前角度范围内没有足够的数据点。")
+                return
 
-            bg_indices = np.where(
-                (x < self.slider_min.get() + 0.5)
-                | (x > self.slider_max.get() - 0.5)
-            )[0]
-            if len(bg_indices) < 2:
-                bg_indices = np.array([0, len(x) - 1])
-            slope_bg, intercept_bg = np.polyfit(x[bg_indices], y_raw[bg_indices], 1)
-            y = y_raw - (slope_bg * x + intercept_bg)
+            background = self._compute_background_for_segment(
+                x,
+                y_raw,
+                angle_min,
+                angle_max,
+                params.get("baseline_state"),
+            )
+            y = y_raw - background
             y[y < 0] = 0
             if y.max() <= 0:
+                self.ui_set(self.progress_var, "错误：无有效信号")
                 return
             y_scaled = y / y.max()
 
-            # ── 2. 构建粒径网格与基矩阵 ─────────────────────────────
-            d_min, d_max = self.slider_d_min.get(), self.slider_d_max.get()
-            raw_pts  = int((d_max - d_min) / 0.1)
-            num_pts  = min(800, max(200, raw_pts))
-            D_range  = np.linspace(d_min, d_max, num_pts)
+            d_min, d_max = params["d_min"], params["d_max"]
+            raw_pts = int((d_max - d_min) / 0.1)
+            num_pts = min(800, max(200, raw_pts))
+            D_range = np.linspace(d_min, d_max, num_pts)
 
-            L_single    = build_regularization_matrix(len(D_range))
+            L_single = build_regularization_matrix(len(D_range))
             basis_total, _, _ = build_basis_matrix(
-                x, mu_centers, D_range, lam1, lam2,
+                x,
+                mu_centers,
+                D_range,
+                lam1,
+                lam2,
                 instrument_fwhm_deg=inst_fwhm,
             )
 
-            # ── 3. 扫描 α（对数空间，50 点）──────────────────────────
-            alpha_values   = np.logspace(-2, 4, 50)
+            alpha_values = np.logspace(-2, 4, 50)
             residual_norms = []
             solution_norms = []
             n_peaks = len(mu_centers)
 
+            from scipy.linalg import block_diag
+
+            L_combined = block_diag(*([L_single] * n_peaks))
             for idx, alpha in enumerate(alpha_values):
+                if self.stop_flag.is_set():
+                    self.ui_set(self.progress_var, "已停止")
+                    return
+                pct = int((idx + 1) * 100 / len(alpha_values))
+                self.ui(self.progress_bar.setValue, pct)
                 self.ui_set(self.progress_var, f"L-Curve 扫描: {idx + 1}/{len(alpha_values)}")
 
                 f_total, _ = solve_nnls_regularized(
                     basis_total, y_scaled, L_single, n_peaks, alpha
                 )
-                from scipy.linalg import block_diag
-                L_combined = block_diag(*([L_single] * n_peaks))
-
                 res_norm = float(np.linalg.norm(basis_total.dot(f_total) - y_scaled))
                 sol_norm = float(np.linalg.norm(L_combined.dot(f_total)))
                 residual_norms.append(res_norm)
                 solution_norms.append(sol_norm)
 
-            # ── 4. 最大曲率法定位拐点 ───────────────────────────────
             x_log = np.log10(residual_norms)
             y_log = np.log10(solution_norms)
 
@@ -117,22 +134,23 @@ class LCurveMixin:
             x_norm = (x_log - x_min) / (x_max - x_min + 1e-15)
             y_norm = (y_log - y_min) / (y_max - y_min + 1e-15)
 
-            # 端点连线方程 Ax + By + C = 0
-            x1, y1 = x_norm[0],  y_norm[0]
+            x1, y1 = x_norm[0], y_norm[0]
             x2, y2 = x_norm[-1], y_norm[-1]
             A = y1 - y2
             B = x2 - x1
             C = x1 * y2 - x2 * y1
-            denom = np.sqrt(A ** 2 + B ** 2) + 1e-15
+            denom = np.sqrt(A**2 + B**2) + 1e-15
             distances = np.abs(A * x_norm + B * y_norm + C) / denom
 
-            best_idx   = int(np.argmax(distances))
+            best_idx = int(np.argmax(distances))
             best_alpha = float(alpha_values[best_idx])
 
-            # ── 5. 弹出结果窗口 ──────────────────────────────────────
             self.ui(
                 self.show_l_curve_popup,
-                residual_norms, solution_norms, alpha_values, best_idx,
+                residual_norms,
+                solution_norms,
+                alpha_values,
+                best_idx,
             )
             self.ui_set(self.progress_var, f"推荐 Alpha: {best_alpha:.2f}")
 
@@ -140,59 +158,76 @@ class LCurveMixin:
             print(f"L-Curve Error: {exc}")
             self.ui(messagebox.showerror, "错误", f"L-Curve 计算失败: {exc}")
         finally:
-            self.ui(lambda: self.btn_lcurve.config(state=tk.NORMAL))
-
-    # ------------------------------------------------------------------
-    # 结果弹窗
-    # ------------------------------------------------------------------
+            self.ui(self.btn_lcurve.setEnabled, True)
 
     def show_l_curve_popup(self, x_data, y_data, alphas, best_idx):
         """在独立窗口中显示 L-Curve，并提供一键应用推荐 α 的按钮。"""
-        top = tk.Toplevel(self.root)
-        top.title("L-Curve 分析结果")
-        top.geometry("700x550")
+        top = QDialog(self)
+        top.setWindowTitle("L-Curve 分析结果")
+        top.resize(700, 550)
+        layout = QVBoxLayout(top)
 
-        fig_lc = plt.figure(figsize=(7, 5), dpi=100)
-        ax = fig_lc.add_subplot(111)
-        ax.loglog(x_data, y_data, "b.-", markersize=8, label="L-Curve")
+        plot = pg.PlotWidget()
+        plot.setBackground("w")
+        plot.setTitle("L-Curve Parameter Selection", color="#111827", size="10pt")
+        plot.setLabel("bottom", "Residual Norm ||Af - y||  (Fitting Error)")
+        plot.setLabel("left", "Solution Norm ||Lf||  (Roughness)")
+        plot.showGrid(x=True, y=True, alpha=0.32)
+        plot.getPlotItem().setLogMode(x=True, y=True)
+        legend = plot.addLegend(offset=(10, 10))
+        legend.setBrush(pg.mkBrush(255, 255, 255, 220))
+        legend.setPen(pg.mkPen("#d1d5db"))
 
-        best_x     = x_data[best_idx]
-        best_y     = y_data[best_idx]
-        best_alpha = alphas[best_idx]
-
-        ax.loglog(
-            best_x, best_y, "ro", markersize=12,
-            label=f"Optimal α = {best_alpha:.2f}",
+        x_arr = np.asarray(x_data, dtype=float)
+        y_arr = np.asarray(y_data, dtype=float)
+        curve = pg.PlotDataItem(
+            x_arr,
+            y_arr,
+            pen=pg.mkPen("#2563eb", width=2),
+            symbol="o",
+            symbolSize=6,
+            symbolBrush=pg.mkBrush("#2563eb"),
+            symbolPen=pg.mkPen("#ffffff", width=1),
+            name="L-Curve",
         )
+        plot.addItem(curve)
+
+        best_x = x_data[best_idx]
+        best_y = y_data[best_idx]
+        best_alpha = alphas[best_idx]
+        best_item = pg.ScatterPlotItem(
+            [best_x],
+            [best_y],
+            size=12,
+            brush=pg.mkBrush("#ef4444"),
+            pen=pg.mkPen("#991b1b", width=1.5),
+            name=f"Optimal alpha = {best_alpha:.2f}",
+        )
+        plot.addItem(best_item)
         for i in range(0, len(alphas), 3):
-            ax.text(x_data[i], y_data[i], f"{alphas[i]:.1e}", fontsize=8)
+            label = pg.TextItem(f"{alphas[i]:.1e}", color="#374151", anchor=(0, 1))
+            font = label.textItem.font()
+            font.setPointSize(7)
+            label.textItem.setFont(font)
+            label.setPos(float(x_data[i]), float(y_data[i]))
+            plot.addItem(label)
 
-        ax.set_xlabel("Residual Norm ‖Af − y‖  (Fitting Error)")
-        ax.set_ylabel("Solution Norm ‖Lf‖  (Roughness)")
-        ax.set_title("L-Curve Parameter Selection")
-        ax.grid(True, which="both", ls="--", alpha=0.5)
-        ax.legend()
-
-        canvas = FigureCanvasTkAgg(fig_lc, master=top)
-        canvas.draw()
-        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        toolbar = NavigationToolbar2Tk(canvas, top)
-        toolbar.update()
-        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        layout.addWidget(plot, 1)
 
         def apply_alpha():
-            self.slider_alpha.set(best_alpha)
-            top.destroy()
+            self.slider_alpha.set(float(best_alpha))
+            top.accept()
             messagebox.showinfo(
                 "提示",
                 f"已应用推荐参数 Alpha = {best_alpha:.2f}\n请点击「精细计算」重新拟合。",
             )
 
-        tk.Button(
-            top,
-            text=f"应用推荐值 (α = {best_alpha:.2f})",
-            command=apply_alpha,
-            bg="#FF9800", fg="white",
-            font=("Arial", 12, "bold"),
-        ).pack(pady=10)
+        btn = QPushButton(f"应用推荐值 (α = {best_alpha:.2f})")
+        btn.setStyleSheet(
+            "background: #f8f9fa; color: #2c3135; font: 9pt 'Microsoft YaHei';"
+            "border: 1px solid #c9ced3; border-radius: 3px; padding: 4px 8px;"
+        )
+        btn.clicked.connect(apply_alpha)
+        layout.addWidget(btn)
+
+        top.exec_()

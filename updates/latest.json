@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "name": "XRD-Analyzer v2.0.0",
+  "asset_name": "XRD-Analyzer.exe",
+  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.0",
+  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.0/XRD-Analyzer.exe",
+  "gitee_release_url": "https://gitee.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.0",
+  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.0/XRD-Analyzer.exe",
+  "sha256": "b60dd4bc3e988279152211c7c24d5616911d67f6051902f25108bc1094465976",
+  "published_at": "2026-06-29",
+  "release_notes": "V2.0.0: PyQt5/pyqtgraph UI, BET-style sample workflow, manual baseline, comparison analysis, MKL-accelerated fitting, and single-file updater package."
+}
