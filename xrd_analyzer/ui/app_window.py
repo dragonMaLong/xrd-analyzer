@@ -33,9 +33,11 @@ from ..core.analysis import build_all_peak_info
 from ..core.fitting import (
     INTENSITY_RATIO,
     WAVELENGTHS,
+    _eval_candidate_chunk_for_index,
     _eval_candidate_for_index,
     build_regularization_matrix,
     fit_with_mu_list,
+    solve_regularized_from_basis,
 )
 from ..io.file_reader import load_file as load_xrd_file
 from ..update_checker import DEFAULT_UPDATE_REPOSITORY, UpdateInfo, check_for_update
@@ -84,6 +86,34 @@ class _UiDispatcher(QObject):
     @pyqtSlot(object, tuple, dict)
     def _run(self, fn, args, kwargs):
         fn(*args, **kwargs)
+
+
+class _ImmediateFuture:
+    def __init__(self, result=None, exception: Exception | None = None):
+        self._result = result
+        self._exception = exception
+
+    def done(self) -> bool:
+        return True
+
+    def result(self):
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def cancel(self) -> bool:
+        return False
+
+
+class _ImmediateExecutor:
+    def submit(self, fn, *args, **kwargs) -> _ImmediateFuture:
+        try:
+            return _ImmediateFuture(result=fn(*args, **kwargs))
+        except Exception as exc:
+            return _ImmediateFuture(exception=exc)
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        return None
 
 
 class UpdateCheckWorker(QObject):
@@ -162,8 +192,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.line_min = None
         self.line_max = None
 
-        self.max_peaks = 5
-        self.peak_colors = ["#FF00FF", "#0077FF", "#00C853", "#FFAB00", "#00E5FF"]
+        self.max_peaks = 1
+        self.peak_colors = ["#FF0000", "#0077FF", "#00C853", "#FFAB00", "#00E5FF"]
         self.active_peak_indices = []
         self.result_active_peak_indices = []
         self.peak_mu_sliders = []
@@ -181,9 +211,11 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self._manual_baseline_curve_item = None
         self._manual_baseline_anchor_items = []
         self._syncing_manual_baseline_anchor = False
-        self.particle_size_min = 0.5
+        self.particle_size_min = 0.1
         self.particle_size_max = 100.0
+        self.particle_size_step = 0.1
         self.instrument_fwhm = 0.0
+        self.regularization_method = "l2"
         self.marker_label_state = {}
         self.plot_view_state = {}
         self.peak_mu_rects_preview = []
@@ -204,6 +236,15 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self._update_download_worker: UpdateDownloadWorker | None = None
         self._update_progress_dialog: QProgressDialog | None = None
         self._available_update_info = None
+        self._fit_cache = None
+        self._fit_worker_running = False
+        self._alpha_fast_running = False
+        self._alpha_fast_pending = False
+        self._alpha_fast_revision = 0
+        self._alpha_fast_timer = QTimer(self)
+        self._alpha_fast_timer.setSingleShot(True)
+        self._alpha_fast_timer.setInterval(120)
+        self._alpha_fast_timer.timeout.connect(self._start_alpha_fast_recompute)
 
         self.source_var = None
 
@@ -544,19 +585,235 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         if directory.is_dir():
             self.settings.setValue("import_directory", str(directory))
 
+    @staticmethod
+    def _build_particle_size_grid(d_min: float, d_max: float, d_step: float) -> np.ndarray:
+        d_min = float(d_min)
+        d_max = float(d_max)
+        d_step = max(float(d_step), 1e-4)
+        if d_max <= d_min:
+            d_max = d_min + d_step
+        count = max(2, int(np.floor((d_max - d_min) / d_step)) + 1)
+        grid = d_min + np.arange(count, dtype=float) * d_step
+        if grid[-1] < d_max - d_step * 0.25:
+            grid = np.append(grid, d_max)
+        else:
+            grid[-1] = min(grid[-1], d_max)
+        return grid
+
+    def _current_sample_key(self) -> str:
+        index = getattr(self, "active_sample_index", -1)
+        samples = getattr(self, "samples", [])
+        if 0 <= index < len(samples):
+            return self._path_key(samples[index].path)
+        return ""
+
+    @staticmethod
+    def _signature_value(value):
+        if isinstance(value, dict):
+            return tuple(
+                (str(key), XRDApp._signature_value(value[key]))
+                for key in sorted(value, key=str)
+            )
+        if isinstance(value, np.ndarray):
+            return tuple(XRDApp._signature_value(v) for v in value.tolist())
+        if isinstance(value, (list, tuple)):
+            return tuple(XRDApp._signature_value(v) for v in value)
+        if isinstance(value, set):
+            return tuple(sorted(XRDApp._signature_value(v) for v in value))
+        if isinstance(value, (float, np.floating)):
+            return round(float(value), 8)
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if value is None:
+            return None
+        return str(value)
+
+    def _fit_signature_from_params(self, params: dict, mu_centers=None) -> tuple:
+        mu_values = params.get("mu_centers", []) if mu_centers is None else mu_centers
+        return (
+            ("sample", str(params.get("sample_key") or self._current_sample_key())),
+            ("source", str(params.get("source", "Cu"))),
+            ("angle_min", round(float(params.get("angle_min", 0.0)), 8)),
+            ("angle_max", round(float(params.get("angle_max", 0.0)), 8)),
+            ("d_min", round(float(params.get("d_min", 0.0)), 8)),
+            ("d_max", round(float(params.get("d_max", 0.0)), 8)),
+            ("d_step", round(float(params.get("d_step", 0.0)), 8)),
+            ("instrument_fwhm", round(float(params.get("instrument_fwhm", 0.0)), 8)),
+            ("regularization_method", str(params.get("regularization_method", "l2")).lower()),
+            ("active_peak_indices", tuple(int(i) for i in params.get("active_peak_indices", []))),
+            ("mu_centers", tuple(round(float(v), 8) for v in mu_values)),
+            ("baseline_state", self._signature_value(params.get("baseline_state"))),
+        )
+
+    @staticmethod
+    def _basis_total_from_components(basis_k1_list, basis_k2_list):
+        pairs = list(zip(basis_k1_list or [], basis_k2_list or []))
+        if not pairs:
+            return None
+        return np.hstack([
+            np.asarray(k1, dtype=float) + np.asarray(k2, dtype=float)
+            for k1, k2 in pairs
+        ])
+
+    def _build_fit_cache(
+        self,
+        params: dict,
+        best_mu: list[float],
+        basis_k1_list,
+        basis_k2_list,
+        y_scaled,
+        L_single,
+        alpha_val: float,
+        resid: float,
+    ) -> dict | None:
+        basis_total = self._basis_total_from_components(basis_k1_list, basis_k2_list)
+        if basis_total is None:
+            return None
+        return {
+            "signature": self._fit_signature_from_params(params, best_mu),
+            "basis_total": basis_total,
+            "y_scaled": np.asarray(y_scaled, dtype=float).copy(),
+            "L_single": np.asarray(L_single, dtype=float).copy(),
+            "n_peaks": int(len(best_mu)),
+            "alpha": float(alpha_val),
+            "last_resid": float(resid),
+            "regularization_method": str(params.get("regularization_method", "l2") or "l2").lower(),
+            "active_peak_indices": list(params.get("active_peak_indices", [])),
+            "best_mu": [float(v) for v in best_mu],
+            "sample_key": str(params.get("sample_key") or self._current_sample_key()),
+        }
+
+    def _alpha_fast_request(self) -> dict | None:
+        if not getattr(self, "data_loaded", False) or not getattr(self, "results_ready", False):
+            return None
+        cache = getattr(self, "_fit_cache", None)
+        if not cache and 0 <= getattr(self, "active_sample_index", -1) < len(getattr(self, "samples", [])):
+            cache = self.samples[self.active_sample_index].results.get("_fit_cache")
+            self._fit_cache = cache
+        if not cache:
+            self.statusBar().showMessage("请先完成一次完整计算，再实时调整 α", 2500)
+            return None
+
+        current_signature = cache.get("signature")
+        cache_sample_key = str(cache.get("sample_key") or "")
+        if cache_sample_key and cache_sample_key != self._current_sample_key():
+            self.statusBar().showMessage("alpha 快速重算缓存与当前样品不匹配，请重新计算", 3000)
+            return None
+
+        basis_total = cache.get("basis_total")
+        y_scaled = cache.get("y_scaled")
+        L_single = cache.get("L_single")
+        n_peaks = int(cache.get("n_peaks") or 0)
+        if basis_total is None or y_scaled is None or L_single is None or n_peaks <= 0:
+            self.statusBar().showMessage("α 快速重算缓存不完整，请重新计算一次", 3000)
+            return None
+
+        return {
+            "revision": int(self._alpha_fast_revision),
+            "signature": current_signature,
+            "sample_key": str(cache.get("sample_key") or self._current_sample_key()),
+            "basis_total": basis_total,
+            "y_scaled": y_scaled,
+            "L_single": L_single,
+            "n_peaks": n_peaks,
+            "alpha": float(self.slider_alpha.get()),
+            "regularization_method": str(cache.get("regularization_method", "l2") or "l2").lower(),
+            "active_peak_indices": list(cache.get("active_peak_indices") or []),
+        }
+
+    def _on_alpha_value_changed(self, _value: float) -> None:
+        self._alpha_fast_revision += 1
+        if getattr(self, "_fit_worker_running", False):
+            return
+        if not getattr(self, "results_ready", False):
+            return
+        self._alpha_fast_timer.start()
+
+    def _start_alpha_fast_recompute(self) -> None:
+        if getattr(self, "_fit_worker_running", False):
+            return
+        if getattr(self, "_alpha_fast_running", False):
+            self._alpha_fast_pending = True
+            return
+        request = self._alpha_fast_request()
+        if request is None:
+            return
+
+        self._alpha_fast_running = True
+        self.statusBar().showMessage(f"正在按 α={request['alpha']:.2f} 快速重算分布...", 1200)
+        threading.Thread(target=self._alpha_fast_worker, args=(request,), daemon=True).start()
+
+    def _alpha_fast_worker(self, request: dict) -> None:
+        f_total = None
+        resid = None
+        error = None
+        try:
+            f_total, resid = solve_regularized_from_basis(
+                request["basis_total"],
+                request["y_scaled"],
+                request["L_single"],
+                request["n_peaks"],
+                request["alpha"],
+                request["regularization_method"],
+            )
+            if f_total is None or f_total.sum() <= 1e-9 or not np.isfinite(f_total).all():
+                raise RuntimeError("求解结果为空")
+        except Exception as exc:
+            error = str(exc)
+        self.ui(self._finish_alpha_fast_recompute, request, f_total, resid, error)
+
+    def _finish_alpha_fast_recompute(self, request: dict, f_total, resid, error) -> None:
+        self._alpha_fast_running = False
+        try:
+            if int(request.get("revision", -1)) != int(getattr(self, "_alpha_fast_revision", -2)):
+                return
+            if error:
+                self.statusBar().showMessage(f"α 快速重算失败：{error}", 3500)
+                return
+
+            request_sample_key = str(request.get("sample_key") or "")
+            if request_sample_key and request_sample_key != self._current_sample_key():
+                return
+
+            if hasattr(self, "_save_current_marker_label_state"):
+                self._save_current_marker_label_state()
+            if hasattr(self, "_save_current_plot_view_state"):
+                self._save_current_plot_view_state()
+            views = self._capture_plot_views() if hasattr(self, "_capture_plot_views") else {}
+
+            self.best_f_total = np.asarray(f_total, dtype=float)
+            self.result_regularization_method = request["regularization_method"]
+            self.result_active_peak_indices = list(request["active_peak_indices"])
+            if isinstance(getattr(self, "_fit_cache", None), dict):
+                self._fit_cache["alpha"] = float(request["alpha"])
+                self._fit_cache["last_resid"] = float(resid)
+            self.process_multi_peak_results(self.result_active_peak_indices)
+            if views and hasattr(self, "_restore_plot_views"):
+                self._restore_plot_views(views)
+            self.statusBar().showMessage(f"α={request['alpha']:.2f} 已快速重算", 1800)
+        finally:
+            if getattr(self, "_alpha_fast_pending", False):
+                self._alpha_fast_pending = False
+                self._alpha_fast_timer.start(1)
+
     def _collect_fit_params(self):
         angle_min = self.slider_min.get()
         angle_max = self.slider_max.get()
         fit_peak_indices = self._selected_peak_indices_in_fit_range(angle_min, angle_max)
         return {
+            "sample_key": self._current_sample_key(),
             "source": self.source_var.get(),
             "mu_centers": [self.peak_mu_sliders[i].get() for i in fit_peak_indices],
             "angle_min": angle_min,
             "angle_max": angle_max,
-            "d_min": float(getattr(self, "particle_size_min", 0.5)),
+            "d_min": float(getattr(self, "particle_size_min", 0.1)),
             "d_max": float(getattr(self, "particle_size_max", 100.0)),
+            "d_step": float(getattr(self, "particle_size_step", 0.1)),
             "alpha": float(self.slider_alpha.get()),
             "instrument_fwhm": float(getattr(self, "instrument_fwhm", 0.0)),
+            "regularization_method": str(getattr(self, "regularization_method", "l2")),
             "active_peak_indices": list(fit_peak_indices),
             "baseline_state": self._current_manual_baseline_state(),
         }
@@ -668,6 +925,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.active_sample_index = -1
         self.data_loaded = False
         self.results_ready = False
+        self._fit_cache = None
         self.refresh_sample_table()
         self.select_sample(target_index)
         self.statusBar().showMessage(f"样品列表已同步：{len(new_samples)} 个 XRD 文件", 4000)
@@ -953,7 +1211,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.data_loaded = True
         self.current_file_name = sample.name
         self.current_metadata = sample.metadata
-        if not sample.peak_states:
+        if sample.peak_states is None:
             sample.peak_states = self._default_peak_states()
         if sample.analysis_state:
             self._apply_analysis_state(sample.analysis_state)
@@ -978,6 +1236,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.update_result_table()
         else:
             self.results_ready = False
+            self._fit_cache = None
             self.clear_result_table()
             if not sample.analysis_state:
                 self._set_default_import_range_and_peak()
@@ -1001,20 +1260,92 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             "all_peak_info": self.all_peak_info,
             "global_max_component_area": self.global_max_component_area,
             "result_active_peak_indices": self.result_active_peak_indices,
+            "result_regularization_method": getattr(self, "result_regularization_method", "l2"),
             "x_segment": self.x_segment,
             "y_segment_raw": self.y_segment_raw,
             "y_segment": self.y_segment,
             "background": self.background,
+            "_fit_cache": getattr(self, "_fit_cache", None),
         }
         self.ui(self.refresh_sample_table)
         self.ui(self._update_comparison_plots_if_available)
 
     def _restore_sample_results(self, sample: XRDSample):
+        self._fit_cache = sample.results.get("_fit_cache")
         for key, value in sample.results.items():
             setattr(self, key, value)
         self._apply_marker_label_state(sample.marker_label_state)
         self._apply_plot_view_state(sample.plot_view_state)
         self.results_ready = True
+
+    def _apply_fit_peak_positions(self, active_peak_indices, mu_values) -> None:
+        for peak_idx, mu in zip(active_peak_indices, mu_values):
+            if peak_idx < len(self.peak_mu_sliders):
+                self.peak_mu_sliders[peak_idx].set(float(mu), emit=False)
+        self._save_current_peak_states()
+        if hasattr(self, "_sync_all_peak_lines"):
+            self._sync_all_peak_lines()
+
+    def _eval_peak_candidate_batch(
+        self,
+        executor,
+        candidates,
+        base_mu,
+        peak_idx,
+        x,
+        y_scaled,
+        lam1,
+        lam2,
+        L_single,
+        D_range,
+        alpha_val,
+        inst_fwhm,
+        progress_state: dict,
+    ):
+        args_common = (
+            tuple(base_mu),
+            int(peak_idx),
+            x,
+            y_scaled,
+            lam1,
+            lam2,
+            INTENSITY_RATIO,
+            L_single,
+            D_range,
+            alpha_val,
+            inst_fwhm,
+        )
+        futs = [executor.submit(_eval_candidate_for_index, float(mu), *args_common) for mu in candidates]
+        pending = set(futs)
+        results = []
+        while pending:
+            if self.stop_flag.is_set():
+                self._stop_process_pool(executor, pending)
+                self.ui_set(self.progress_var, "已停止")
+                return None
+
+            finished, pending = wait(
+                pending,
+                timeout=0.05,
+                return_when=FIRST_COMPLETED,
+            )
+            for fut in finished:
+                try:
+                    loss, mu_val = fut.result()
+                except Exception:
+                    loss, mu_val = np.inf, None
+
+                progress_state["done"] = int(progress_state.get("done", 0)) + 1
+                estimate = max(1, int(progress_state.get("estimate", 1)))
+                pct = min(95, int(progress_state["done"] * 95 / estimate))
+                self.ui(self.progress_bar.setValue, pct)
+                self.ui_set(
+                    self.progress_var,
+                    f"扫描峰 {int(peak_idx) + 1}/{int(progress_state.get('peak_count', 1))}: {pct}%",
+                )
+                if mu_val is not None:
+                    results.append((float(loss), float(mu_val)))
+        return results
 
     def compute_thread(self, mode: str = "fine"):
         """在后台线程中启动拟合计算，避免阻塞 UI。"""
@@ -1030,6 +1361,10 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             messagebox.showwarning("提示", "当前蓝色拟合范围内没有峰，请先在范围内添加或移动峰。")
             return
 
+        self._alpha_fast_revision += 1
+        self._alpha_fast_pending = False
+        self._alpha_fast_timer.stop()
+        self._fit_worker_running = True
         self.stop_flag.clear()
         self.progress_label.show()
         self.progress_bar.show()
@@ -1080,24 +1415,42 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             y_scaled = y / y.max()
 
             d_min, d_max = params["d_min"], params["d_max"]
-            raw_pts = int((d_max - d_min) / 0.1)
-            num_pts = min(800, max(200, raw_pts))
-            self.D_range = np.linspace(d_min, d_max, num_pts)
+            d_step = float(params.get("d_step", getattr(self, "particle_size_step", 0.1)) or 0.1)
+            self.D_range = self._build_particle_size_grid(d_min, d_max, d_step)
             L_single = build_regularization_matrix(len(self.D_range))
+            scan_D_range = self.D_range
+            scan_L_single = L_single
 
             alpha_val = float(params["alpha"])
             inst_fwhm = float(params["instrument_fwhm"])
+            regularization_method = str(params.get("regularization_method", "l2") or "l2").lower()
 
             if mode == "fast":
-                halfwidth, steps = 0.0, 1
+                halfwidth, steps = 0.0, 0
+                self.ui(self.progress_bar.setValue, 20)
+                self.ui_set(self.progress_var, "固定峰位拟合...")
             else:
                 halfwidth, steps = 0.1, 11
+                scan_target_points = 220
+                span = max(float(d_max) - float(d_min), 0.0)
+                scan_d_step = max(float(d_step), span / max(1, scan_target_points - 1))
+                scan_D_range = self._build_particle_size_grid(d_min, d_max, scan_d_step)
+                if len(scan_D_range) < len(self.D_range):
+                    scan_L_single = build_regularization_matrix(len(scan_D_range))
+                else:
+                    scan_D_range = self.D_range
+                    scan_L_single = L_single
 
-            total = max(1, len(mu_centers) * steps)
+            total = max(1, len(mu_centers) * max(1, steps))
             done = 0
             best_mu = list(mu_centers)
+            scan_executor = None
+            scan_executor_stopped = False
+            scan_workers = min(4, os.cpu_count() or 1)
+            if mode != "fast":
+                scan_executor = ProcessPoolExecutor(max_workers=scan_workers)
 
-            for i in range(len(best_mu)):
+            for i in ([] if mode == "fast" else range(len(best_mu))):
                 if self.stop_flag.is_set():
                     self.ui_set(self.progress_var, "已停止")
                     return
@@ -1111,8 +1464,13 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 candidates = np.linspace(low, high, steps)
                 best_loss = None
                 best_val = center
-                max_workers = min(4, os.cpu_count() or 1)
 
+                ex = scan_executor
+                chunks = [
+                    np.asarray(chunk, dtype=float)
+                    for chunk in np.array_split(candidates, min(scan_workers, len(candidates)))
+                    if len(chunk)
+                ]
                 args_common = (
                     tuple(best_mu),
                     i,
@@ -1121,20 +1479,26 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                     lam1,
                     lam2,
                     INTENSITY_RATIO,
-                    L_single,
-                    self.D_range,
+                    scan_L_single,
+                    scan_D_range,
                     alpha_val,
                     inst_fwhm,
                 )
-
-                ex = ProcessPoolExecutor(max_workers=max_workers)
-                futs = [ex.submit(_eval_candidate_for_index, mu, *args_common) for mu in candidates]
-                pending = set(futs)
+                future_counts = {
+                    ex.submit(
+                        _eval_candidate_chunk_for_index,
+                        tuple(float(mu) for mu in chunk),
+                        *args_common,
+                    ): len(chunk)
+                    for chunk in chunks
+                }
+                pending = set(future_counts)
                 stopped = False
                 try:
                     while pending:
                         if self.stop_flag.is_set():
                             stopped = True
+                            scan_executor_stopped = True
                             self._stop_process_pool(ex, pending)
                             self.ui_set(self.progress_var, "已停止")
                             return
@@ -1146,22 +1510,27 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                         )
                         for fut in finished:
                             try:
-                                loss, mu_val = fut.result()
+                                results = list(fut.result())
                             except Exception:
-                                loss, mu_val = np.inf, None
+                                results = [(np.inf, None)] * int(future_counts.get(fut, 1))
 
-                            done += 1
-                            pct = int(done * 100 / total)
-                            self.ui(self.progress_bar.setValue, pct)
-                            self.ui_set(
-                                self.progress_var,
+                            expected_count = int(future_counts.get(fut, len(results)))
+                            if len(results) < expected_count:
+                                results.extend([(np.inf, None)] * (expected_count - len(results)))
+
+                            for loss, mu_val in results:
+                                done += 1
+                                pct = min(95, int(done * 95 / total))
+                                self.ui(self.progress_bar.setValue, pct)
+                                self.ui_set(
+                                    self.progress_var,
                                 f"扫描峰 {i + 1}/{len(best_mu)}：{pct}%",
-                            )
+                                )
 
-                            if mu_val is not None and (best_loss is None or loss < best_loss):
-                                best_loss, best_val = loss, mu_val
+                                if mu_val is not None and (best_loss is None or loss < best_loss):
+                                    best_loss, best_val = loss, mu_val
                 finally:
-                    if not stopped:
+                    if scan_executor is None and not stopped:
                         ex.shutdown(wait=False, cancel_futures=True)
 
                 best_mu[i] = best_val
@@ -1170,7 +1539,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 self.ui_set(self.progress_var, "已停止")
                 return
 
-            ex = ProcessPoolExecutor(max_workers=1)
+            ex = scan_executor if scan_executor is not None else _ImmediateExecutor()
             fut = ex.submit(
                 fit_with_mu_list,
                 x,
@@ -1182,12 +1551,15 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 self.D_range,
                 alpha_val,
                 instrument_fwhm_deg=inst_fwhm,
+                regularization_method=regularization_method,
             )
             stopped = False
             try:
                 while not fut.done():
                     if self.stop_flag.is_set():
                         stopped = True
+                        if ex is scan_executor:
+                            scan_executor_stopped = True
                         self._stop_process_pool(ex, (fut,))
                         self.ui_set(self.progress_var, "已停止")
                         return
@@ -1196,6 +1568,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             finally:
                 if not stopped:
                     ex.shutdown(wait=False, cancel_futures=True)
+                    if ex is scan_executor:
+                        scan_executor_stopped = True
 
             if f_total is None:
                 self.ui_set(self.progress_var, "拟合失败：解全为零")
@@ -1206,16 +1580,23 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.all_basis_k2 = basis_k2_list
             self.result_active_peak_indices = list(params["active_peak_indices"])
 
-            for peak_idx, mu in zip(params["active_peak_indices"], best_mu):
-                if peak_idx < len(self.peak_mu_sliders):
-                    self.ui(self.peak_mu_sliders[peak_idx].set, mu)
-
-            self.ui(self._hide_axes0_overlays)
+            self.ui(self._apply_fit_peak_positions, list(params["active_peak_indices"]), list(best_mu))
 
             self.x_segment = x
             self.y_segment_raw = y_raw
             self.y_segment = y
             self.background = background
+            self.result_regularization_method = regularization_method
+            self._fit_cache = self._build_fit_cache(
+                params,
+                best_mu,
+                basis_k1_list,
+                basis_k2_list,
+                y_scaled,
+                L_single,
+                alpha_val,
+                resid,
+            )
 
             self.process_multi_peak_results(self.result_active_peak_indices)
             self.ui_set(self.progress_var, "拟合成功！")
@@ -1224,6 +1605,13 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.ui(messagebox.showwarning, "提示", f"计算过程中发生错误: {exc}")
             self.ui_set(self.progress_var, "计算失败")
         finally:
+            executor = locals().get("scan_executor")
+            if executor is not None and not locals().get("scan_executor_stopped", False):
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+            self._fit_worker_running = False
             for btn in (self.btn_fast, self.btn_fine):
                 self.ui(btn.setEnabled, True)
 
@@ -1246,6 +1634,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.result_active_peak_indices = active_peak_indices
         self.results_ready = True
         self._store_current_sample_results()
+        self.ui(self.progress_bar.setValue, 100)
         self.ui(self.update_multi_peak_plots)
         self.ui(self.update_result_table)
         self.ui_set(self.progress_var, "拟合成功！")

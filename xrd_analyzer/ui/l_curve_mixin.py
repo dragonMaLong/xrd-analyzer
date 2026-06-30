@@ -30,8 +30,9 @@ class LCurveMixin:
             "mu_centers": [self.peak_mu_sliders[i].get() for i in fit_peak_indices],
             "angle_min": angle_min,
             "angle_max": angle_max,
-            "d_min": float(getattr(self, "particle_size_min", 0.5)),
+            "d_min": float(getattr(self, "particle_size_min", 0.1)),
             "d_max": float(getattr(self, "particle_size_max", 100.0)),
+            "d_step": float(getattr(self, "particle_size_step", 0.1)),
             "instrument_fwhm": float(getattr(self, "instrument_fwhm", 0.0)),
             "baseline_state": self._current_manual_baseline_state(),
         }
@@ -88,9 +89,11 @@ class LCurveMixin:
             y_scaled = y / y.max()
 
             d_min, d_max = params["d_min"], params["d_max"]
-            raw_pts = int((d_max - d_min) / 0.1)
-            num_pts = min(800, max(200, raw_pts))
-            D_range = np.linspace(d_min, d_max, num_pts)
+            d_step = float(params.get("d_step", getattr(self, "particle_size_step", 0.1)) or 0.1)
+            if hasattr(self, "_build_particle_size_grid"):
+                D_range = self._build_particle_size_grid(d_min, d_max, d_step)
+            else:
+                D_range = np.arange(float(d_min), float(d_max) + d_step * 0.5, d_step)
 
             L_single = build_regularization_matrix(len(D_range))
             basis_total, _, _ = build_basis_matrix(
