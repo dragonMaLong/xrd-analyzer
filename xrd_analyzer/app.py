@@ -35,24 +35,12 @@ import multiprocessing as mp
 if sys.platform.startswith("win") or getattr(sys, "frozen", False):
     mp.set_start_method("spawn", force=True)
 
-# ── DPI 感知（仅 Windows，让 Tkinter 在高分屏上渲染清晰）────────────────
-try:
-    from ctypes import windll
-    windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    pass
-
-# ── Matplotlib 中文字体全局设置 ──────────────────────────────────────────
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
-
 
 def main():
     """预编译 Numba 后启动 GUI。"""
-    import tkinter as tk
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QFont
+    from PyQt5.QtWidgets import QApplication
     from xrd_analyzer.core.peak_functions import precompile_numba_functions
     from xrd_analyzer.ui.app_window import XRDApp
 
@@ -60,34 +48,17 @@ def main():
     precompile_numba_functions()
     print("Done. Starting GUI.")
 
-    root = tk.Tk()
-    app  = XRDApp(root)
-
-    def on_closing():
-        app.stop_flag.set()
-        root.quit()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_closing)
-    interrupt_count = 0
-    while True:
-        try:
-            root.mainloop()
-            break
-        except KeyboardInterrupt:
-            interrupt_count += 1
-            try:
-                alive = bool(root.winfo_exists())
-            except tk.TclError:
-                alive = False
-
-            if not alive:
-                break
-            if interrupt_count >= 2:
-                on_closing()
-                break
-
-            print("Ignored one startup interrupt. Close the GUI window or press Ctrl+C again to exit.")
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    qt_app = QApplication.instance() or QApplication(sys.argv)
+    qt_app.setStyle("windowsvista")
+    qt_app.setFont(QFont("Microsoft YaHei UI", 9))
+    win = XRDApp()
+    win.show()
+    try:
+        sys.exit(qt_app.exec_())
+    except KeyboardInterrupt:
+        win.stop_flag.set()
+        win.close()
 
 
 if __name__ == "__main__":
