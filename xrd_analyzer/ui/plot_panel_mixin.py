@@ -593,6 +593,13 @@ class ClickProjectionCursor:
         self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
         self.view_box.sigRangeChanged.connect(lambda *_args: self.update())
 
+    def _is_disabled(self) -> bool:
+        guard = getattr(self.plot, "_click_projection_cursor_disabled", False)
+        try:
+            return bool(guard()) if callable(guard) else bool(guard)
+        except Exception:
+            return False
+
     def reattach(self) -> None:
         added_items = getattr(self.view_box, "addedItems", [])
         for item in (self.vertical_line, self.horizontal_line, self.x_label, self.y_label):
@@ -601,6 +608,9 @@ class ClickProjectionCursor:
         self.update()
 
     def _on_mouse_clicked(self, event) -> None:
+        if self._is_disabled():
+            self.clear()
+            return
         if event.button() != Qt.LeftButton:
             return
         if _legend_contains_scene_pos(self.plot, event.scenePos()):
@@ -631,6 +641,9 @@ class ClickProjectionCursor:
         self.hide()
 
     def update(self) -> None:
+        if self._is_disabled():
+            self.hide()
+            return
         if self.point is None:
             self.hide()
             return
@@ -1556,6 +1569,7 @@ class PlotPanelMixin:
         self.preview_plot.setTitle("完整数据预览", color="#111827", size="10pt")
         self.preview_ax = self.preview_plot
         self.preview_canvas = self.preview_plot
+        self.preview_plot.scene().sigMouseClicked.connect(self._on_preview_plot_mouse_clicked)
         preview_layout.addWidget(self.preview_plot, 1)
 
         self.top_plot_splitter = _configure_splitter(QtWidgets.QSplitter(Qt.Horizontal), handle_width=7)
@@ -1571,6 +1585,9 @@ class PlotPanelMixin:
 
         self.fit_plot = self._make_plot("拟合范围预览", "Intensity", "2θ (°)")
         self.size_plot = self._make_plot("粒径分布 (计算后显示)", "Volume Density", "Particle size (nm)")
+        self.fit_plot._click_projection_cursor_disabled = lambda: bool(
+            getattr(self, "manual_baseline_enabled", False)
+        )
         self.fit_plot.setMinimumHeight(80)
         self.size_plot.setMinimumHeight(80)
         setattr(self.size_plot, "_legend_default_position", "right")
@@ -1592,12 +1609,15 @@ class PlotPanelMixin:
         self.plot_vertical_splitter.addWidget(self.bottom_plot_splitter)
         self.plot_vertical_splitter.setStretchFactor(0, 1)
         self.plot_vertical_splitter.setStretchFactor(1, 1)
-        self.plot_vertical_splitter.setSizes([430, 520])
+        self.plot_vertical_splitter.setSizes([470, 480])
 
         self.canvas = self.plot_vertical_splitter
         self.canvas_widget = self.plot_vertical_splitter
         self.toolbar = None
         self.right_layout.addWidget(self.plot_vertical_splitter, 1)
+        self._initial_preview_height_applied = False
+        QtCore.QTimer.singleShot(0, self._apply_initial_preview_height)
+        QtCore.QTimer.singleShot(120, self._apply_initial_preview_height)
         self._setup_comparison_tab()
         self.right_tabs.currentChanged.connect(self._on_right_tab_changed)
 
@@ -1620,6 +1640,27 @@ class PlotPanelMixin:
         self.fit_marker_text_items = []
         self._fit_marker_text_legend = None
         self._size_visibility = {}
+
+    def _apply_initial_preview_height(self) -> None:
+        if getattr(self, "_initial_preview_height_applied", False):
+            return
+        splitter = getattr(self, "plot_vertical_splitter", None)
+        button = getattr(self, "btn_fast", None)
+        if splitter is None or button is None or not button.isVisible():
+            return
+
+        sizes = splitter.sizes()
+        total = sum(sizes) if sizes else splitter.height()
+        if total <= 0:
+            return
+
+        button_bottom = button.mapTo(splitter, QtCore.QPoint(0, button.height())).y()
+        target_top = max(180, min(int(button_bottom), int(total - 160)))
+        if target_top <= 0:
+            return
+
+        splitter.setSizes([target_top, max(160, int(total - target_top))])
+        self._initial_preview_height_applied = True
 
     def _setup_comparison_tab(self) -> None:
         self.compare_tab = QWidget()
@@ -1819,6 +1860,8 @@ class PlotPanelMixin:
         setattr(plot, "_manual_sample_legend_entries", [])
         setattr(plot, "_sample_legend_graphics_entries", [])
         setattr(plot, "_sample_legend_hover_index", None)
+        if hasattr(self, "_clear_plot_coordinate_artifacts"):
+            self._clear_plot_coordinate_artifacts(plot)
         plot.clear()
         if plot is getattr(self, "fit_plot", None):
             self._manual_baseline_curve_item = None
@@ -2196,6 +2239,10 @@ class PlotPanelMixin:
 
     def _on_manual_baseline_toggled(self, checked: bool) -> None:
         self.manual_baseline_enabled = bool(checked)
+        if self.manual_baseline_enabled:
+            cursor = getattr(getattr(self, "fit_plot", None), "_click_projection_cursor", None)
+            if cursor is not None and hasattr(cursor, "clear"):
+                cursor.clear()
         self._save_current_manual_baseline_state()
         if self.manual_baseline_enabled:
             self._draw_manual_baseline_overlay()
@@ -2550,6 +2597,448 @@ class PlotPanelMixin:
         view_range = plot.getPlotItem().getViewBox().viewRange()
         return view_range[0], view_range[1]
 
+    @staticmethod
+    def _format_x_coordinate(value: float) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except Exception:
+            return ""
+
+    def _line_coordinate_label(self, plot: pg.PlotWidget, line) -> pg.TextItem | None:
+        if plot is None or line is None:
+            return None
+        label = getattr(line, "_xrd_coordinate_label", None)
+        if label is not None:
+            return label
+        label = pg.TextItem(
+            text="",
+            color="#111827",
+            anchor=(0.0, 1.0),
+            fill=pg.mkBrush(255, 255, 255, 235),
+            border=pg.mkPen("#2563eb", width=1.0),
+        )
+        label.setZValue(6000)
+        try:
+            label.setAcceptedMouseButtons(Qt.LeftButton)
+            label.setCursor(Qt.IBeamCursor)
+        except Exception:
+            pass
+
+        def label_mouse_click(event, coord_label=label):
+            try:
+                if event.button() == Qt.LeftButton:
+                    event.accept()
+                    self._edit_coordinate_label_inline(coord_label)
+                    return
+            except Exception:
+                pass
+
+        label.mouseClickEvent = label_mouse_click
+        try:
+            plot.addItem(label, ignoreBounds=True)
+        except Exception:
+            return None
+        line._xrd_coordinate_label = label
+        label.hide()
+        return label
+
+    def _discard_coordinate_label(self, line) -> None:
+        if line is None:
+            return
+        label = getattr(line, "_xrd_coordinate_label", None)
+        if label is None:
+            return
+        editor = getattr(label, "_xrd_editor", None)
+        if editor is not None:
+            try:
+                editor.hide()
+                editor.deleteLater()
+            except Exception:
+                pass
+            label._xrd_editor = None
+            label._xrd_editing = False
+        plot = getattr(label, "_xrd_plot", None) or getattr(line, "_xrd_plot", None)
+        if plot is not None:
+            try:
+                plot.removeItem(label)
+            except Exception:
+                pass
+        try:
+            label.hide()
+        except Exception:
+            pass
+        line._xrd_coordinate_label = None
+        line._xrd_coordinate_label_token = None
+
+    def _clear_peak_coordinate_artifacts(self, peak_idx: int | None = None) -> None:
+        for lines in (
+            getattr(self, "peak_mu_lines_preview", []),
+            getattr(self, "peak_mu_lines_axes0", []),
+        ):
+            for line in list(lines or []):
+                if line is None:
+                    continue
+                if peak_idx is not None and getattr(line, "_xrd_peak_idx", None) != peak_idx:
+                    continue
+                self._discard_coordinate_label(line)
+
+    def _clear_plot_coordinate_artifacts(self, plot: pg.PlotWidget) -> None:
+        for line in (getattr(self, "line_min", None), getattr(self, "line_max", None)):
+            if getattr(line, "_xrd_plot", None) is plot:
+                self._discard_coordinate_label(line)
+        for lines in (
+            getattr(self, "peak_mu_lines_preview", []),
+            getattr(self, "peak_mu_lines_axes0", []),
+        ):
+            for line in list(lines or []):
+                if line is not None and getattr(line, "_xrd_plot", None) is plot:
+                    self._discard_coordinate_label(line)
+        try:
+            for editor in plot.findChildren(QtWidgets.QLineEdit, "xrdCoordinateInlineEditor"):
+                editor.hide()
+                editor.deleteLater()
+        except Exception:
+            pass
+
+    def _show_line_coordinate_label(
+        self,
+        plot: pg.PlotWidget,
+        line,
+        preferred_side: str = "right",
+        *,
+        timeout_ms: int = 1000,
+    ) -> None:
+        label = self._line_coordinate_label(plot, line)
+        if label is None:
+            return
+        self._cancel_coordinate_editor_if_unchanged(label)
+        try:
+            x_value = float(line.value())
+            x_range, y_range = self._plot_range(plot)
+            x_left, x_right = sorted((float(x_range[0]), float(x_range[1])))
+            y_bottom = min(float(y_range[0]), float(y_range[1]))
+        except Exception:
+            return
+        if not all(np.isfinite(v) for v in (x_value, x_left, x_right, y_bottom)):
+            return
+
+        span = max(abs(x_right - x_left), 1e-9)
+        edge_margin = span * 0.045
+        side = preferred_side if preferred_side in {"left", "right"} else "right"
+        if side == "left" and x_value - x_left <= edge_margin:
+            side = "right"
+        elif side == "right" and x_right - x_value <= edge_margin:
+            side = "left"
+        label.setAnchor((1.0, 1.0) if side == "left" else (0.0, 1.0))
+        label.setText(self._format_x_coordinate(x_value))
+        label.setPos(x_value, y_bottom)
+        label._xrd_line = line
+        label._xrd_plot = plot
+        label._xrd_side = side
+        label.show()
+
+        token = object()
+        line._xrd_coordinate_label_token = token
+
+        def hide_if_current() -> None:
+            if getattr(label, "_xrd_editing", False):
+                return
+            if getattr(line, "_xrd_coordinate_label_token", None) is token:
+                try:
+                    label.hide()
+                except Exception:
+                    pass
+
+        if int(timeout_ms) > 0:
+            QtCore.QTimer.singleShot(int(timeout_ms), hide_if_current)
+
+    def _edit_coordinate_label_inline(self, label) -> None:
+        line = getattr(label, "_xrd_line", None)
+        plot = getattr(label, "_xrd_plot", None)
+        if line is None or plot is None:
+            return
+        old_editor = getattr(label, "_xrd_editor", None)
+        if old_editor is not None:
+            try:
+                old_editor.setFocus()
+                old_editor.selectAll()
+                return
+            except Exception:
+                pass
+        label._xrd_editing = True
+        try:
+            current = self._format_x_coordinate(float(line.value()))
+        except Exception:
+            current = str(label.toPlainText() if hasattr(label, "toPlainText") else "")
+        editor = QtWidgets.QLineEdit(str(current), plot)
+        editor.setObjectName("xrdCoordinateInlineEditor")
+        editor.setAlignment(Qt.AlignCenter)
+        editor.setFixedSize(70, 22)
+        editor.setStyleSheet(
+            """
+            QLineEdit#xrdCoordinateInlineEditor {
+                background: rgba(255, 255, 255, 235);
+                border: 1px solid #2563eb;
+                border-radius: 0;
+                color: #111827;
+                font: 9pt 'Microsoft YaHei UI';
+                padding: 0 2px;
+            }
+            """
+        )
+        label._xrd_editor = editor
+        label._xrd_editor_original_text = str(current)
+        self._position_coordinate_editor(editor, label)
+        editor.show()
+        editor.raise_()
+        editor.setFocus(Qt.MouseFocusReason)
+        editor.selectAll()
+        label.hide()
+        done = {"active": False}
+
+        def cancel() -> None:
+            if done["active"]:
+                return
+            done["active"] = True
+            try:
+                editor.hide()
+                editor.deleteLater()
+            except Exception:
+                pass
+            label._xrd_editor = None
+            label._xrd_editing = False
+            label.show()
+
+        def finish() -> None:
+            if done["active"]:
+                return
+            done["active"] = True
+            text = editor.text().strip()
+            try:
+                value = float(text)
+            except Exception:
+                done["active"] = False
+                editor.setFocus(Qt.OtherFocusReason)
+                editor.selectAll()
+                return
+            try:
+                editor.hide()
+                editor.deleteLater()
+            except Exception:
+                pass
+            label._xrd_editor = None
+            label._xrd_editing = False
+            self._apply_coordinate_label_value(label, value)
+
+        editor._xrd_cancel = cancel
+        editor._xrd_finish = finish
+        editor.returnPressed.connect(finish)
+        editor.editingFinished.connect(finish)
+
+    def _cancel_coordinate_editor_if_unchanged(self, label) -> None:
+        editor = getattr(label, "_xrd_editor", None)
+        if editor is None:
+            return
+        original = str(getattr(label, "_xrd_editor_original_text", ""))
+        current = str(editor.text()).strip()
+        if current != original:
+            finish = getattr(editor, "_xrd_finish", None)
+            if callable(finish):
+                finish()
+            return
+        cancel = getattr(editor, "_xrd_cancel", None)
+        if callable(cancel):
+            cancel()
+
+    def _position_coordinate_editor(self, editor: QtWidgets.QLineEdit, label) -> None:
+        plot = getattr(label, "_xrd_plot", None)
+        line = getattr(label, "_xrd_line", None)
+        if plot is None or line is None:
+            return
+        try:
+            rect = label.sceneBoundingRect()
+            top_left = plot.mapFromScene(rect.topLeft())
+            bottom_right = plot.mapFromScene(rect.bottomRight())
+            if hasattr(top_left, "toPoint"):
+                top_left = top_left.toPoint()
+            if hasattr(bottom_right, "toPoint"):
+                bottom_right = bottom_right.toPoint()
+            x1, y1 = int(top_left.x()), int(top_left.y())
+            x2, y2 = int(bottom_right.x()), int(bottom_right.y())
+            x, y = min(x1, x2), min(y1, y2)
+            width = max(46, abs(x2 - x1))
+            height = max(20, abs(y2 - y1))
+            editor.setFixedSize(width, height)
+        except Exception:
+            x, y = 8, max(4, plot.height() - editor.height() - 28)
+        x = max(4, min(x, max(4, plot.width() - editor.width() - 4)))
+        y = max(4, min(y, max(4, plot.height() - editor.height() - 4)))
+        editor.move(x, y)
+
+    def _apply_coordinate_label_value(self, label, value: float) -> None:
+        line = getattr(label, "_xrd_line", None)
+        if line is None:
+            return
+        kind = getattr(line, "_xrd_coordinate_type", "peak")
+        if kind == "range":
+            self._apply_range_boundary_value(line, value)
+            self._show_range_line_coordinate(line, timeout_ms=2200)
+            return
+        peak_idx = getattr(line, "_xrd_peak_idx", None)
+        if peak_idx is None:
+            return
+        self._apply_peak_line_value(int(peak_idx), line, value)
+        self._show_peak_line_coordinate(line, timeout_ms=2200)
+
+    def _range_line_preferred_label_side(self, line) -> str:
+        region = getattr(self, "preview_range_region", None)
+        if region is None or line is None:
+            return "right"
+        try:
+            left, right = sorted(float(v) for v in region.getRegion())
+            value = float(line.value())
+            return "left" if abs(value - left) <= abs(value - right) else "right"
+        except Exception:
+            return getattr(line, "_xrd_range_label_side", "right")
+
+    def _install_range_line_interaction(self, line, preferred_side: str) -> None:
+        if line is None or getattr(line, "_xrd_range_interaction_installed", False):
+            return
+        line._xrd_range_label_side = preferred_side
+        try:
+            line.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        except Exception:
+            pass
+        original_mouse_click = line.mouseClickEvent
+
+        def mouse_click_event(event, *, range_line=line, original=original_mouse_click):
+            try:
+                if event.button() == Qt.RightButton:
+                    event.accept()
+                    self._show_range_line_coordinate(range_line, timeout_ms=2200)
+                    return
+            except Exception:
+                pass
+            return original(event)
+
+        line.mouseClickEvent = mouse_click_event
+        try:
+            line.sigPositionChanged.connect(
+                lambda item, range_line=line: self._show_range_line_coordinate(range_line)
+            )
+            line.sigPositionChangeFinished.connect(
+                lambda item, range_line=line: self._show_range_line_coordinate(range_line, timeout_ms=1200)
+            )
+        except Exception:
+            pass
+        line._xrd_range_interaction_installed = True
+        line._xrd_coordinate_type = "range"
+        line._xrd_plot = self.preview_plot
+
+    def _install_range_region_context_menu(self, region) -> None:
+        if region is None or getattr(region, "_xrd_context_menu_installed", False):
+            return
+        original_mouse_click = region.mouseClickEvent
+
+        def mouse_click_event(event, *, original=original_mouse_click):
+            try:
+                if event.button() == Qt.RightButton:
+                    event.accept()
+                    self._show_preview_region_context_menu()
+                    return
+            except Exception:
+                pass
+            return original(event)
+
+        region.mouseClickEvent = mouse_click_event
+        region._xrd_context_menu_installed = True
+
+    def _show_range_line_coordinate(self, line, *, timeout_ms: int = 1800) -> None:
+        self._show_line_coordinate_label(
+            self.preview_plot,
+            line,
+            self._range_line_preferred_label_side(line),
+            timeout_ms=timeout_ms,
+        )
+
+    def _show_peak_line_coordinate(self, line, *, timeout_ms: int = 1800) -> None:
+        plot = getattr(line, "_xrd_plot", None)
+        if plot is None:
+            source = getattr(line, "_xrd_source", "")
+            plot = self.preview_plot if source == "preview" else self.fit_plot
+        self._show_line_coordinate_label(plot, line, "right", timeout_ms=timeout_ms)
+
+    def _apply_range_boundary_value(self, line, value: float) -> None:
+        region = getattr(self, "preview_range_region", None)
+        if region is None or line is None:
+            return
+        try:
+            left, right = sorted(float(v) for v in region.getRegion())
+        except Exception:
+            return
+        low_bound, high_bound = self._peak_value_bounds()
+        value = max(float(low_bound), min(float(high_bound), float(value)))
+        role = self._range_line_preferred_label_side(line)
+        if role == "left":
+            new_region = (value, right)
+        else:
+            new_region = (left, value)
+        try:
+            region.setRegion(tuple(sorted(new_region)))
+        except Exception:
+            return
+        self._on_range_region_finished()
+
+    def _apply_peak_line_value(self, peak_idx: int, line, value: float) -> None:
+        if peak_idx < 0 or peak_idx >= len(getattr(self, "peak_mu_sliders", [])):
+            return
+        low_bound, high_bound = self._peak_value_bounds()
+        value = max(float(low_bound), min(float(high_bound), float(value)))
+        self._syncing_peak_line = True
+        try:
+            self.peak_mu_sliders[peak_idx].set(value, emit=False)
+            self._sync_peak_line_value(peak_idx, value)
+        finally:
+            self._syncing_peak_line = False
+        self._save_current_peak_states()
+
+    def _on_preview_plot_mouse_clicked(self, event) -> None:
+        try:
+            if event.button() != Qt.RightButton or event.isAccepted():
+                return
+        except Exception:
+            return
+        region = getattr(self, "preview_range_region", None)
+        if region is None or not getattr(self, "data_loaded", False):
+            return
+        view_box = self.preview_plot.getPlotItem().getViewBox()
+        scene_pos = event.scenePos()
+        if not view_box.sceneBoundingRect().contains(scene_pos):
+            return
+        try:
+            x_value = float(view_box.mapSceneToView(scene_pos).x())
+            left, right = sorted(float(v) for v in region.getRegion())
+        except Exception:
+            return
+        if x_value < left or x_value > right:
+            return
+        event.accept()
+        self._show_preview_region_context_menu()
+
+    def _show_preview_region_context_menu(self) -> None:
+        menu = QtWidgets.QMenu(self.preview_plot)
+        apply_action = menu.addAction("应用全部")
+        menu.addSeparator()
+        view_all_action = menu.addAction("View All")
+        chosen = menu.exec_(QtGui.QCursor.pos())
+        if chosen == apply_action:
+            self._apply_analysis_range_to_all_samples()
+        elif chosen == view_all_action:
+            try:
+                self.preview_plot.getPlotItem().getViewBox().autoRange()
+            except Exception:
+                pass
+
     def _current_fit_default_range(self) -> tuple[float, float]:
         region = getattr(self, "preview_range_region", None)
         if region is not None:
@@ -2769,6 +3258,24 @@ class PlotPanelMixin:
             hoverPen=self._curve_pen(color, width=2.2, alpha=1.0),
         )
         self._set_resize_cursor(line)
+        try:
+            line.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        except Exception:
+            pass
+        original_mouse_click = line.mouseClickEvent
+
+        def mouse_click_event(event, *, idx=peak_idx, peak_line=line, original=original_mouse_click):
+            try:
+                if event.button() == Qt.RightButton:
+                    event.accept()
+                    if hasattr(self, "_delete_peak_index"):
+                        self._delete_peak_index(idx)
+                    return
+            except Exception:
+                pass
+            return original(event)
+
+        line.mouseClickEvent = mouse_click_event
         line.setZValue(1000)
         try:
             low, high = self._peak_value_bounds()
@@ -2783,6 +3290,9 @@ class PlotPanelMixin:
                 lambda item, idx=peak_idx, src=source: self._on_peak_line_change_finished(idx, item, src)
             )
         line._xrd_peak_idx = peak_idx
+        line._xrd_source = source
+        line._xrd_plot = self.preview_plot if source == "preview" else self.fit_plot
+        line._xrd_coordinate_type = "peak"
         return line
 
     def _redraw_axes0_peak_markers(self) -> None:
@@ -2923,6 +3433,7 @@ class PlotPanelMixin:
             if 0 <= peak_idx < len(self.peak_mu_sliders):
                 self.peak_mu_sliders[peak_idx].set(value, emit=False)
             self._sync_peak_line_value(peak_idx, value, exclude=line)
+            self._show_peak_line_coordinate(line)
         finally:
             self._syncing_peak_line = False
 
@@ -2930,6 +3441,7 @@ class PlotPanelMixin:
         if 0 <= peak_idx < len(self.peak_mu_sliders):
             self.peak_mu_sliders[peak_idx].set(float(line.value()), emit=False)
         self._save_current_peak_states()
+        self._show_peak_line_coordinate(line, timeout_ms=1200)
 
     def update_preview(self, val=None):
         if not self.data_loaded:
@@ -2966,9 +3478,12 @@ class PlotPanelMixin:
         self.preview_range_region.sigRegionChanged.connect(self._on_range_region_changed)
         self.preview_range_region.sigRegionChangeFinished.connect(self._on_range_region_finished)
         self.preview_plot.addItem(self.preview_range_region)
+        self._install_range_region_context_menu(self.preview_range_region)
         self.preview_range_span = self.preview_range_region
         try:
-            self.line_min, self.line_max = self.preview_range_region.lines
+            range_lines = list(self.preview_range_region.lines)
+            range_lines.sort(key=lambda item: float(item.value()))
+            self.line_min, self.line_max = range_lines
         except Exception:
             self.line_min = self.line_max = None
         range_pen = self._curve_pen("#2563eb", width=2.0, style=Qt.DashLine, alpha=0.95)
@@ -2980,6 +3495,8 @@ class PlotPanelMixin:
             except Exception:
                 pass
             self._set_resize_cursor(line)
+        self._install_range_line_interaction(self.line_min, "left")
+        self._install_range_line_interaction(self.line_max, "right")
 
         for peak_idx in self.active_peak_indices:
             if peak_idx >= len(self.peak_mu_sliders) or not self._peak_visible(peak_idx):

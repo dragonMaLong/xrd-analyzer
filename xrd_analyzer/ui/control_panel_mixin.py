@@ -225,14 +225,22 @@ class _TitleActionGroupBox(QtWidgets.QGroupBox):
 
     def __init__(self, title: str, action_text: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(title, parent)
+        self._action_right_margin = 8
         self.action_button = QtWidgets.QPushButton(action_text, self)
         self.action_button.setFixedSize(72, 22)
         self.action_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.action_button.raise_()
 
+    def set_action_right_margin(self, margin: int) -> None:
+        self._action_right_margin = max(8, int(margin))
+        self.update()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.action_button.move(max(8, self.width() - self.action_button.width() - 8), 0)
+        self.action_button.move(
+            max(8, self.width() - self.action_button.width() - self._action_right_margin),
+            0,
+        )
         self.action_button.raise_()
 
 
@@ -316,16 +324,20 @@ class ControlPanelMixin:
         label.setStyleSheet("font: 700 9pt 'Microsoft YaHei UI'; color: #111827;")
         return label
 
-    def _param_row(self, widget: QtWidgets.QWidget, index: int) -> QtWidgets.QFrame:
+    def _param_row(self, widget: QtWidgets.QWidget, index: int, *, striped: bool = True) -> QtWidgets.QFrame:
         row = QtWidgets.QFrame()
         row.setMinimumHeight(28)
-        row.setObjectName("paramRowEven" if index % 2 == 0 else "paramRowOdd")
-        row.setStyleSheet(
-            """
-            #paramRowEven { background: #ffffff; border: 0; }
-            #paramRowOdd { background: #eef1f4; border: 0; }
-            """
-        )
+        if striped:
+            row.setObjectName("paramRowEven" if index % 2 == 0 else "paramRowOdd")
+            row.setStyleSheet(
+                """
+                #paramRowEven { background: #ffffff; border: 0; }
+                #paramRowOdd { background: #eef1f4; border: 0; }
+                """
+            )
+        else:
+            row.setObjectName("paramRowPlain")
+            row.setStyleSheet("#paramRowPlain { background: transparent; border: 0; }")
         layout = QtWidgets.QVBoxLayout(row)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(0)
@@ -486,13 +498,14 @@ class ControlPanelMixin:
         self.sample_param_table = self._make_detail_table(["参数", "值"])
         self.sample_param_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_param_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        self.sample_result_table = self._make_detail_table(["Peak", "峰面积", "峰高", "尺寸", "百分比"])
+        self.sample_result_table = self._make_detail_table(["Peak", "峰面积", "峰高", "尺寸", "面积百分比", "高度百分比"])
         self.sample_result_table.horizontalHeader().setStretchLastSection(False)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        self.sample_result_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_detail_tabs.addTab(self.sample_param_table, "样品")
         self.sample_detail_tabs.addTab(self.sample_result_table, "计算结果")
         parent_layout.addWidget(self.sample_detail_tabs, 2)
@@ -597,52 +610,30 @@ class ControlPanelMixin:
         layout.setSpacing(3)
 
         row_index = 0
-        range_group = _TitleActionGroupBox("分析区间", "应用全部", panel)
-        range_group.action_button.setFixedSize(92, 22)
-        range_layout = QtWidgets.QVBoxLayout(range_group)
-        range_layout.setContentsMargins(8, 12, 8, 8)
-        range_layout.setSpacing(4)
-        range_group.action_button.setToolTip("把当前起始角和结束角应用到全部样品")
-        range_group.action_button.setStyleSheet(
-            """
-            QPushButton {
-                background: #f8f9fa;
-                color: #2c3135;
-                font: 9pt 'Microsoft YaHei UI';
-                border: 1px solid #c9ced3;
-                border-radius: 3px;
-                padding: 0 6px;
-                min-height: 0;
-            }
-            QPushButton:hover {
-                background: #eef1f3;
-                border-color: #aeb6bd;
-            }
-            QPushButton:pressed {
-                background: #e5e9ed;
-            }
-            """
-        )
-        range_group.action_button.clicked.connect(self._apply_analysis_range_to_all_samples)
-
         self.slider_min = QtLabeledSpin("起始角", 0, 100, 60, decimals=2, step=0.01, parent=panel)
         self.slider_min.valueChanged.connect(lambda v: self._on_angle_slider_changed("min", v))
-        range_layout.addWidget(self._param_row(self.slider_min, row_index))
-        row_index += 1
+        self.slider_min.hide()
 
         self.slider_max = QtLabeledSpin("结束角", 0, 100, 74.6, decimals=2, step=0.01, parent=panel)
         self.slider_max.valueChanged.connect(lambda v: self._on_angle_slider_changed("max", v))
-        range_layout.addWidget(self._param_row(self.slider_max, row_index))
-        row_index += 1
-        layout.addWidget(range_group)
+        self.slider_max.hide()
 
-        peak_group = _TitleActionGroupBox("晶面选择", "添加", panel)
+        peak_group = QtWidgets.QGroupBox("晶面选择", panel)
         peak_layout = QtWidgets.QVBoxLayout(peak_group)
-        peak_layout.setContentsMargins(8, 12, 8, 8)
+        peak_layout.setContentsMargins(8, 14, 8, 8)
         peak_layout.setSpacing(4)
-        add_peak_button = peak_group.action_button
+
+        peak_actions = QtWidgets.QHBoxLayout()
+        peak_actions.setContentsMargins(0, 0, 0, 0)
+        peak_actions.setSpacing(4)
+        peak_actions.addStretch(1)
+        self.peaks_detail_button = QtWidgets.QPushButton("详情", peak_group)
+        self.peaks_detail_button.setCheckable(True)
+        self.peaks_detail_button.setFixedSize(48, 22)
+        self.peaks_detail_button.setToolTip("展开或收起默认峰列表")
+        add_peak_button = QtWidgets.QPushButton("添加", peak_group)
         add_peak_button.setFixedSize(56, 22)
-        add_peak_button.setStyleSheet(
+        peak_button_style = (
             """
             QPushButton {
                 background: #f8f9fa;
@@ -662,6 +653,12 @@ class ControlPanelMixin:
             }
             """
         )
+        self.peaks_detail_button.setStyleSheet(peak_button_style)
+        add_peak_button.setStyleSheet(peak_button_style)
+        peak_actions.addWidget(self.peaks_detail_button)
+        peak_actions.addWidget(add_peak_button)
+        peak_layout.addLayout(peak_actions)
+        self.peaks_detail_button.toggled.connect(self._set_peak_details_visible)
         add_peak_button.clicked.connect(self.add_peak_control)
         row_index += 1
 
@@ -676,6 +673,7 @@ class ControlPanelMixin:
         self.peaks_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.peaks_scroll.setMaximumHeight(162)
         self.peaks_scroll.setWidget(self.peaks_frame)
+        self.peaks_scroll.hide()
         peak_layout.addWidget(self.peaks_scroll)
         layout.addWidget(peak_group)
 
@@ -687,6 +685,8 @@ class ControlPanelMixin:
             self.update_ui_for_peaks()
 
         self.slider_alpha = QtSpinSlider("平滑因子 (α)", 0.01, 100, 1, 0.01, decimals=2, parent=panel)
+        self.slider_alpha.valueChanged.connect(self._on_alpha_value_changed)
+        self.slider_alpha.slider.sliderReleased.connect(lambda: self._alpha_fast_timer.start(1))
         layout.addWidget(self._param_row(self.slider_alpha, row_index))
         row_index += 1
 
@@ -775,36 +775,82 @@ class ControlPanelMixin:
         form.setVerticalSpacing(6)
 
         d_min_spin = QtWidgets.QDoubleSpinBox(dialog)
-        d_min_spin.setRange(0.1, 1.0)
+        d_min_spin.setRange(0.01, 1000.0)
         d_min_spin.setDecimals(2)
         d_min_spin.setSingleStep(0.1)
-        d_min_spin.setSuffix(" nm")
-        d_min_spin.setValue(float(getattr(self, "particle_size_min", 0.5)))
+        d_min_spin.setFixedWidth(108)
+        d_min_spin.setValue(float(getattr(self, "particle_size_min", 0.1)))
 
         d_max_spin = QtWidgets.QDoubleSpinBox(dialog)
-        d_max_spin.setRange(50.0, 300.0)
+        d_max_spin.setRange(0.02, 1000.0)
         d_max_spin.setDecimals(2)
         d_max_spin.setSingleStep(1.0)
-        d_max_spin.setSuffix(" nm")
+        d_max_spin.setFixedWidth(108)
         d_max_spin.setValue(float(getattr(self, "particle_size_max", 100.0)))
 
+        def unit_field(spin: QtWidgets.QDoubleSpinBox, unit: str) -> QtWidgets.QWidget:
+            field = QtWidgets.QWidget(dialog)
+            row = QtWidgets.QHBoxLayout(field)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            unit_label = QtWidgets.QLabel(unit, field)
+            unit_label.setStyleSheet("font: 8pt 'Microsoft YaHei'; color: #4b5563;")
+            row.addWidget(spin)
+            row.addWidget(unit_label)
+            row.addStretch(1)
+            return field
+
+        d_min_field = unit_field(d_min_spin, "nm")
+        d_max_field = unit_field(d_max_spin, "nm")
+
+        d_step_combo = QtWidgets.QComboBox(dialog)
+        d_step_combo.addItem("0.10 nm（标准）", 0.10)
+        d_step_combo.addItem("0.05 nm（精细）", 0.05)
+        d_step_combo.addItem("0.02 nm（高精度）", 0.02)
+        d_step_combo.addItem("0.01 nm（超高精度）", 0.01)
+        current_step = float(getattr(self, "particle_size_step", 0.1) or 0.1)
+        step_index = min(
+            range(d_step_combo.count()),
+            key=lambda i: abs(float(d_step_combo.itemData(i)) - current_step),
+        )
+        d_step_combo.setCurrentIndex(step_index)
+
         fwhm_spin = QtWidgets.QDoubleSpinBox(dialog)
-        fwhm_spin.setRange(0.0, 0.5)
+        fwhm_spin.setRange(0.0, 5.0)
         fwhm_spin.setDecimals(4)
         fwhm_spin.setSingleStep(0.001)
         fwhm_spin.setSuffix(" °")
         fwhm_spin.setValue(float(getattr(self, "instrument_fwhm", 0.0)))
 
+        algorithm_combo = QtWidgets.QComboBox(dialog)
+        algorithm_combo.addItem("平滑 L2（当前默认）", "l2")
+        algorithm_combo.addItem("TV 高分辨（实验）", "tv")
+        algorithm_combo.addItem("L2+TV 混合（实验）", "hybrid")
+        current_algorithm = str(getattr(self, "regularization_method", "l2") or "l2").lower()
+        index = algorithm_combo.findData(current_algorithm)
+        algorithm_combo.setCurrentIndex(index if index >= 0 else 0)
+
         for spin in (d_min_spin, d_max_spin, fwhm_spin):
             spin.setKeyboardTracking(False)
+            spin.setLocale(QtCore.QLocale.c())
+            spin.setCorrectionMode(QtWidgets.QAbstractSpinBox.CorrectToNearestValue)
+            spin.lineEdit().editingFinished.connect(spin.interpretText)
             spin.setStyleSheet(
                 "QDoubleSpinBox { min-height: 22px; padding: 1px 6px;"
                 " border: 1px solid #c6cbd0; border-radius: 3px;"
                 " background: white; font: 8pt 'Microsoft YaHei'; }"
             )
+        algorithm_combo.setStyleSheet(
+            "QComboBox { min-height: 22px; padding: 1px 6px;"
+            " border: 1px solid #c6cbd0; border-radius: 3px;"
+            " background: white; font: 8pt 'Microsoft YaHei'; }"
+        )
+        d_step_combo.setStyleSheet(algorithm_combo.styleSheet())
 
-        form.addRow("最小粒径", d_min_spin)
-        form.addRow("最大粒径", d_max_spin)
+        form.addRow("正则算法", algorithm_combo)
+        form.addRow("最小粒径", d_min_field)
+        form.addRow("最大粒径", d_max_field)
+        form.addRow("粒径步长", d_step_combo)
         form.addRow("仪器展宽矫正", fwhm_spin)
         layout.addLayout(form)
 
@@ -821,7 +867,12 @@ class ControlPanelMixin:
         buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("取消")
         layout.addWidget(buttons)
 
+        def commit_spinbox_edits() -> None:
+            for spin in (d_min_spin, d_max_spin, fwhm_spin):
+                spin.interpretText()
+
         def apply_values() -> bool:
+            commit_spinbox_edits()
             d_min = float(d_min_spin.value())
             d_max = float(d_max_spin.value())
             if d_max <= d_min:
@@ -829,7 +880,9 @@ class ControlPanelMixin:
                 return False
             self.particle_size_min = d_min
             self.particle_size_max = d_max
+            self.particle_size_step = float(d_step_combo.currentData() or 0.1)
             self.instrument_fwhm = float(fwhm_spin.value())
+            self.regularization_method = str(algorithm_combo.currentData() or "l2")
             return True
 
         def accept_dialog() -> None:
@@ -922,6 +975,21 @@ class ControlPanelMixin:
         self.peaks_frame.setMinimumHeight(height)
         self.peaks_frame.resize(width, height)
 
+    def _set_peak_details_visible(self, visible: bool) -> None:
+        if not hasattr(self, "peaks_scroll"):
+            return
+        self.peaks_scroll.setVisible(bool(visible))
+        button = getattr(self, "peaks_detail_button", None)
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(bool(visible))
+            button.setText("收起" if visible else "详情")
+            button.blockSignals(False)
+        self._update_peak_scroll_extent()
+        pane = getattr(self, "analysis_options_pane", None)
+        if pane is not None and hasattr(pane, "_sync_content_height"):
+            pane._sync_content_height()
+
     def add_peak_control(self):
         self.max_peaks = len(self.peak_mu_sliders) + 1
         region = getattr(self, "preview_range_region", None)
@@ -933,7 +1001,14 @@ class ControlPanelMixin:
         else:
             angle_min, angle_max = self._normalize_angle_range()
         center = (float(angle_min) + float(angle_max)) / 2.0
-        self._create_peak_control(self.max_peaks - 1, checked=True, value=center)
+        new_index = self.max_peaks - 1
+        self._create_peak_control(
+            new_index,
+            checked=True,
+            value=center,
+            color=self._default_peak_color(new_index),
+        )
+        self._set_peak_details_visible(True)
 
     def _attach_peak_context_menu(self, widget: QtWidgets.QWidget, row: QtWidgets.QWidget) -> None:
         widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -945,8 +1020,6 @@ class ControlPanelMixin:
         )
 
     def _show_peak_context_menu(self, row: QtWidgets.QWidget, global_pos: QtCore.QPoint) -> None:
-        if len(self.peak_mu_sliders) <= 1:
-            return
         menu = QtWidgets.QMenu(row)
         delete_action = menu.addAction("删除")
         if menu.exec_(global_pos) == delete_action:
@@ -956,21 +1029,36 @@ class ControlPanelMixin:
         if not hasattr(self, "peak_rows") or row not in self.peak_rows:
             return
         index = self.peak_rows.index(row)
+        if hasattr(self, "_clear_peak_coordinate_artifacts"):
+            self._clear_peak_coordinate_artifacts(index)
         states = self._current_peak_states()
-        if len(states) <= 1:
-            return
         del states[index]
+        for i, state in enumerate(states):
+            state["color"] = self._default_peak_color(i)
         self._apply_peak_states(states)
         self._save_current_peak_states()
         self.update_preview()
 
-    def _peak_color(self, peak_idx: int) -> str:
+    def _delete_peak_index(self, peak_idx: int) -> None:
+        rows = getattr(self, "peak_rows", [])
+        try:
+            index = int(peak_idx)
+        except Exception:
+            return
+        if 0 <= index < len(rows):
+            self._delete_peak_row(rows[index])
+
+    @staticmethod
+    def _default_peak_color(peak_idx: int) -> str:
         palette = [
-            "#FF00FF", "#0077FF", "#00C853", "#FFAB00", "#00E5FF",
+            "#FF0000", "#0077FF", "#00C853", "#FFAB00", "#00E5FF",
             "#8E24AA", "#D81B60", "#43A047", "#F4511E", "#3949AB",
         ]
+        return palette[int(peak_idx) % len(palette)]
+
+    def _peak_color(self, peak_idx: int) -> str:
         while peak_idx >= len(self.peak_colors):
-            self.peak_colors.append(palette[len(self.peak_colors) % len(palette)])
+            self.peak_colors.append(self._default_peak_color(len(self.peak_colors)))
         return self.peak_colors[peak_idx]
 
     def _set_peak_color_value(self, peak_idx: int, color: str | None) -> str:
@@ -1063,12 +1151,12 @@ class ControlPanelMixin:
             self._save_current_peak_states()
         self.update_preview()
 
-    def _default_peak_states(self, count: int = 5) -> list[dict[str, float | bool | str]]:
+    def _default_peak_states(self, count: int = 1) -> list[dict[str, float | bool | str]]:
         return [
             {
-                "checked": i == 0,
+                "checked": True,
                 "value": float(60 + i),
-                "color": self._peak_color(i),
+                "color": self._default_peak_color(i),
                 "visible": True,
             }
             for i in range(int(count))
@@ -1164,11 +1252,11 @@ class ControlPanelMixin:
         self._normalize_angle_range()
 
     def _apply_peak_states(self, states: list[dict[str, float | bool | str]]) -> None:
-        states = list(states or self._default_peak_states())
+        states = self._default_peak_states() if states is None else list(states)
         self._building_peak_controls = True
         try:
             for i, state in enumerate(states):
-                self._set_peak_color_value(i, str(state.get("color", self._peak_color(i))))
+                self._set_peak_color_value(i, str(state.get("color", self._default_peak_color(i))))
             while self.peaks_layout.count():
                 item = self.peaks_layout.takeAt(0)
                 widget = item.widget()
@@ -1187,7 +1275,7 @@ class ControlPanelMixin:
                     i,
                     checked=bool(state.get("checked", i == 0)),
                     value=float(state.get("value", 60 + i)),
-                    color=str(state.get("color", self._peak_color(i))),
+                    color=str(state.get("color", self._default_peak_color(i))),
                     visible=bool(state.get("visible", True)),
                 )
         finally:
@@ -1246,7 +1334,7 @@ class ControlPanelMixin:
         for row, values in enumerate(rows):
             for col, value in enumerate(values):
                 alignment = None
-                if col in {1, 2, 4}:
+                if col in {1, 2, 4, 5}:
                     alignment = QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
                 elif col == 3:
                     alignment = QtCore.Qt.AlignCenter
@@ -1257,12 +1345,12 @@ class ControlPanelMixin:
                     item.setFont(font)
                 self.sample_result_table.setItem(row, col, item)
 
-    def _result_rows(self) -> list[tuple[str, str, str, str, str]]:
+    def _result_rows(self) -> list[tuple[str, str, str, str, str, str]]:
         if not getattr(self, "results_ready", False):
             return []
         all_peak_info = list(getattr(self, "all_peak_info", []) or [])
         active_indices = list(getattr(self, "result_active_peak_indices", []) or [])
-        rows: list[tuple[str, str, str, str, str]] = []
+        rows: list[tuple[str, str, str, str, str, str]] = []
         for i, info in enumerate(all_peak_info):
             peak_idx = active_indices[i] if i < len(active_indices) else i
             peak_label = f"Peak{peak_idx + 1}"
@@ -1271,19 +1359,30 @@ class ControlPanelMixin:
             details = list(info.get("peak_details", []) or [])
             total_area = self._xrd_fit_area(info)
             total_height = self._xrd_fit_height(info)
-            rows.append((peak_label, self._format_area(total_area), self._format_height(total_height), "", "100%"))
+            rows.append((peak_label, self._format_area(total_area), self._format_height(total_height), "", "100%", "100%"))
+            detail_metrics = []
             for j, det in enumerate(details, start=1):
                 area = self._xrd_fit_area(info, det)
                 height = self._xrd_fit_height(info, det)
+                detail_metrics.append((j, det, area, height))
+            area_denominator = sum(max(0.0, area) for _j, _det, area, _height in detail_metrics)
+            height_denominator = sum(max(0.0, height) for _j, _det, _area, height in detail_metrics)
+            if area_denominator <= 0:
+                area_denominator = total_area
+            if height_denominator <= 0:
+                height_denominator = total_height
+            for j, det, area, height in detail_metrics:
                 center = det.get("center", None)
-                percentage = (area / total_area * 100.0) if total_area > 0 else 0.0
+                area_percentage = (area / area_denominator * 100.0) if area_denominator > 0 else 0.0
+                height_percentage = (height / height_denominator * 100.0) if height_denominator > 0 else 0.0
                 rows.append(
                     (
                         f"Peak{peak_idx + 1}-{j}",
                         self._format_area(area),
                         self._format_height(height),
                         f"{float(center):.2f} nm" if center is not None else "",
-                        f"{percentage:.1f}%",
+                        f"{area_percentage:.1f}%",
+                        f"{height_percentage:.1f}%",
                     )
                 )
         return rows

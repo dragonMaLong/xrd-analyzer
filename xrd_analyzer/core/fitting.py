@@ -7,7 +7,7 @@ core/fitting.py
 必须保持在模块顶层，以便 ProcessPoolExecutor 能够序列化（pickle）传入子进程。
 """
 import numpy as np
-from scipy.optimize import nnls
+from scipy.optimize import minimize, nnls
 from scipy.sparse import diags
 from scipy.linalg import block_diag
 
@@ -52,6 +52,25 @@ def build_regularization_matrix(n_d_points: int) -> np.ndarray:
     return diags([-1, 1], [0, 1], shape=(n_d_points - 1, n_d_points)).toarray()
 
 
+def build_peak_basis(x, mu, D_range, lam1, lam2,
+                     intensity_ratio=INTENSITY_RATIO,
+                     instrument_fwhm_deg=0.0):
+    mu_ka2 = calc_kalpha2_position(mu, lam1, lam2)
+
+    gamma1, m1 = calc_peak_params_numba(
+        mu, lam1, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
+        instrument_fwhm_deg,
+    )
+    gamma2, m2 = calc_peak_params_numba(
+        mu_ka2, lam2, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
+        instrument_fwhm_deg,
+    )
+
+    pk1 = pearson_vii_numba(x, mu, gamma1, m1)
+    pk2 = pearson_vii_numba(x, mu_ka2, gamma2, m2) * intensity_ratio
+    return pk1, pk2
+
+
 def build_basis_matrix(x, mu_list, D_range, lam1, lam2,
                         intensity_ratio=INTENSITY_RATIO,
                         instrument_fwhm_deg=0.0):
@@ -73,26 +92,20 @@ def build_basis_matrix(x, mu_list, D_range, lam1, lam2,
     basis_k2_list  : list[ndarray]  — 每个峰的 Kα2 子矩阵
     """
     basis_k1_list, basis_k2_list = [], []
+    n_rows = len(x)
+    n_d = len(D_range)
+    basis_total = np.empty((n_rows, len(mu_list) * n_d), dtype=float)
 
-    for mu in mu_list:
-        mu_ka2 = calc_kalpha2_position(mu, lam1, lam2)
-
-        gamma1, m1 = calc_peak_params_numba(
-            mu, lam1, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
+    for idx, mu in enumerate(mu_list):
+        pk1, pk2 = build_peak_basis(
+            x, mu, D_range, lam1, lam2, intensity_ratio,
             instrument_fwhm_deg,
         )
-        gamma2, m2 = calc_peak_params_numba(
-            mu_ka2, lam2, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
-            instrument_fwhm_deg,
-        )
-
-        pk1 = pearson_vii_numba(x, mu,     gamma1, m1)
-        pk2 = pearson_vii_numba(x, mu_ka2, gamma2, m2) * intensity_ratio
 
         basis_k1_list.append(pk1)
         basis_k2_list.append(pk2)
+        basis_total[:, idx * n_d:(idx + 1) * n_d] = pk1 + pk2
 
-    basis_total = np.hstack([k1 + k2 for k1, k2 in zip(basis_k1_list, basis_k2_list)])
     return basis_total, basis_k1_list, basis_k2_list
 
 
@@ -125,13 +138,159 @@ def solve_nnls_regularized(basis_total, y_scaled, L_single, n_peaks, alpha):
     return f_total, resid
 
 
+def solve_tv_regularized(
+    basis_total,
+    y_scaled,
+    L_single,
+    n_peaks,
+    alpha,
+    *,
+    max_iter: int = 300,
+    epsilon: float = 1e-6,
+):
+    """
+    平滑 TV 正则化非负求解。
+
+    目标函数:
+        0.5 * ||A f - y||² + alpha * sum(sqrt((L f)² + epsilon²))
+
+    与当前 L2/Tikhonov 方法并行存在，用于实验高分辨粒径分布。
+    """
+    basis_total = np.asarray(basis_total, dtype=float)
+    y_scaled = np.asarray(y_scaled, dtype=float)
+    L_combined = block_diag(*([L_single] * n_peaks))
+    tv_weight = max(float(alpha), 1e-12)
+    eps = max(float(epsilon), 1e-12)
+
+    try:
+        x0, _ = solve_nnls_regularized(basis_total, y_scaled, L_single, n_peaks, alpha)
+    except Exception:
+        x0 = np.zeros(basis_total.shape[1], dtype=float)
+    if x0.size != basis_total.shape[1] or not np.isfinite(x0).all():
+        x0 = np.zeros(basis_total.shape[1], dtype=float)
+
+    def objective_and_grad(f):
+        f = np.asarray(f, dtype=float)
+        residual = basis_total.dot(f) - y_scaled
+        diff = L_combined.dot(f)
+        smooth_abs = np.sqrt(diff * diff + eps * eps)
+        obj = 0.5 * float(residual.dot(residual)) + tv_weight * float(np.sum(smooth_abs))
+        grad = basis_total.T.dot(residual)
+        grad += tv_weight * L_combined.T.dot(diff / smooth_abs)
+        return obj, grad
+
+    result = minimize(
+        objective_and_grad,
+        x0,
+        method="L-BFGS-B",
+        jac=True,
+        bounds=[(0.0, None)] * int(basis_total.shape[1]),
+        options={"maxiter": int(max_iter), "ftol": 1e-9, "gtol": 1e-6},
+    )
+    f_total = np.asarray(result.x, dtype=float)
+    f_total = np.clip(f_total, 0.0, None)
+    resid = float(np.linalg.norm(basis_total.dot(f_total) - y_scaled))
+    return f_total, resid
+
+
+def solve_hybrid_regularized(
+    basis_total,
+    y_scaled,
+    L_single,
+    n_peaks,
+    alpha,
+    *,
+    tv_ratio: float = 0.20,
+    max_iter: int = 300,
+    epsilon: float = 1e-6,
+):
+    """
+    L2 + TV 混合正则化非负求解。
+
+    目标函数:
+        0.5 * ||A f - y||²
+        + 0.5 * alpha² * ||L f||²
+        + alpha * tv_ratio * sum(sqrt((L f)² + epsilon²))
+
+    L2 项负责整体平滑，TV 项保留局部边缘；相比纯 TV，通常能减轻柱状/阶梯状结果。
+    """
+    basis_total = np.asarray(basis_total, dtype=float)
+    y_scaled = np.asarray(y_scaled, dtype=float)
+    L_combined = block_diag(*([L_single] * n_peaks))
+    alpha_val = max(float(alpha), 1e-12)
+    l2_weight = alpha_val * alpha_val
+    tv_weight = alpha_val * max(float(tv_ratio), 0.0)
+    eps = max(float(epsilon), 1e-12)
+
+    try:
+        x0, _ = solve_nnls_regularized(basis_total, y_scaled, L_single, n_peaks, alpha)
+    except Exception:
+        x0 = np.zeros(basis_total.shape[1], dtype=float)
+    if x0.size != basis_total.shape[1] or not np.isfinite(x0).all():
+        x0 = np.zeros(basis_total.shape[1], dtype=float)
+
+    def objective_and_grad(f):
+        f = np.asarray(f, dtype=float)
+        residual = basis_total.dot(f) - y_scaled
+        diff = L_combined.dot(f)
+        smooth_abs = np.sqrt(diff * diff + eps * eps)
+        obj = 0.5 * float(residual.dot(residual))
+        obj += 0.5 * l2_weight * float(diff.dot(diff))
+        obj += tv_weight * float(np.sum(smooth_abs))
+        grad = basis_total.T.dot(residual)
+        grad += l2_weight * L_combined.T.dot(diff)
+        if tv_weight > 0.0:
+            grad += tv_weight * L_combined.T.dot(diff / smooth_abs)
+        return obj, grad
+
+    result = minimize(
+        objective_and_grad,
+        x0,
+        method="L-BFGS-B",
+        jac=True,
+        bounds=[(0.0, None)] * int(basis_total.shape[1]),
+        options={"maxiter": int(max_iter), "ftol": 1e-9, "gtol": 1e-6},
+    )
+    f_total = np.asarray(result.x, dtype=float)
+    f_total = np.clip(f_total, 0.0, None)
+    resid = float(np.linalg.norm(basis_total.dot(f_total) - y_scaled))
+    return f_total, resid
+
+
 # ---------------------------------------------------------------------------
 # 主拟合函数（在主进程中被 app_window.py 调用）
 # ---------------------------------------------------------------------------
 
+def solve_regularized_from_basis(
+    basis_total,
+    y_scaled,
+    L_single,
+    n_peaks,
+    alpha,
+    regularization_method: str = "l2",
+):
+    """Solve with an already-built basis matrix.
+
+    Used by the alpha fast path after peak positions and the data window are fixed.
+    """
+    method = str(regularization_method or "l2").lower()
+    if method in {"hybrid", "mixed", "l2_tv", "l2+tv"}:
+        return solve_hybrid_regularized(
+            basis_total, y_scaled, L_single, n_peaks, alpha
+        )
+    if method == "tv":
+        return solve_tv_regularized(
+            basis_total, y_scaled, L_single, n_peaks, alpha
+        )
+    return solve_nnls_regularized(
+        basis_total, y_scaled, L_single, n_peaks, alpha
+    )
+
+
 def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
                      intensity_ratio=INTENSITY_RATIO,
-                     instrument_fwhm_deg=0.0):
+                     instrument_fwhm_deg=0.0,
+                     regularization_method: str = "l2"):
     """
     给定峰位列表，完整执行一次正则化 NNLS 拟合。
 
@@ -146,8 +305,13 @@ def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
         x, mu_list, D_range, lam1, lam2, intensity_ratio,
         instrument_fwhm_deg
     )
-    f_total, resid = solve_nnls_regularized(
-        basis_total, y_scaled, L_single, len(mu_list), alpha
+    f_total, resid = solve_regularized_from_basis(
+        basis_total,
+        y_scaled,
+        L_single,
+        len(mu_list),
+        alpha,
+        regularization_method,
     )
     if f_total.sum() <= 1e-9 or not np.isfinite(f_total).all():
         return np.inf, None, None, None
@@ -178,6 +342,58 @@ def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
     if f_total.sum() <= 0 or not np.isfinite(f_total).all():
         return np.inf, None
     return resid, f_total
+
+
+def _eval_candidate_chunk_for_index(candidates, base_mu, peak_idx,
+                                    x, y_scaled, lam1, lam2, intensity_ratio,
+                                    L_single, D_range, alpha_val,
+                                    instrument_fwhm_deg=0.0):
+    """
+    Evaluate several candidate positions for one peak.
+
+    The unchanged peak basis blocks are built once per chunk; each candidate only
+    rebuilds the basis block for peak_idx. This keeps the scan result equivalent
+    to _eval_candidate_for_index while avoiding repeated work.
+    """
+    precompile_numba_functions()
+
+    base_mu = list(base_mu)
+    candidates = [float(mu) for mu in candidates]
+    peak_idx = int(peak_idx)
+    n_peaks = len(base_mu)
+    n_d = int(len(D_range))
+    if not candidates or n_peaks <= 0 or n_d <= 0:
+        return []
+
+    basis_total = np.empty((len(x), n_peaks * n_d), dtype=float)
+    current_slice = slice(peak_idx * n_d, (peak_idx + 1) * n_d)
+
+    for idx, mu in enumerate(base_mu):
+        if idx == peak_idx:
+            continue
+        pk1, pk2 = build_peak_basis(
+            x, mu, D_range, lam1, lam2, intensity_ratio,
+            instrument_fwhm_deg,
+        )
+        basis_total[:, idx * n_d:(idx + 1) * n_d] = pk1 + pk2
+
+    results = []
+    for mu_val in candidates:
+        try:
+            pk1, pk2 = build_peak_basis(
+                x, mu_val, D_range, lam1, lam2, intensity_ratio,
+                instrument_fwhm_deg,
+            )
+            basis_total[:, current_slice] = pk1 + pk2
+            f_total, resid = solve_nnls_regularized(
+                basis_total, y_scaled, L_single, n_peaks, alpha_val
+            )
+            if f_total.sum() <= 0 or not np.isfinite(f_total).all():
+                resid = np.inf
+        except Exception:
+            resid = np.inf
+        results.append((float(resid), float(mu_val)))
+    return results
 
 
 def _eval_candidate_for_index(mu_val, base_mu, peak_idx,
