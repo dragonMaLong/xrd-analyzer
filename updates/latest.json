@@ -1,16 +1,16 @@
 {
-  "version": "2.0.1",
-  "name": "XRD-Analyzer v2.0.1",
+  "version": "2.0.2",
+  "name": "XRD-Analyzer v2.0.2",
   "asset_name": "XRD-Analyzer.exe",
-  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.1",
-  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.1/XRD-Analyzer.exe",
-  "gitee_release_url": "https://gitee.com/dragonMalong/xrd-analyzer/releases/tag/v2.0.1",
+  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.2",
+  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe",
+  "gitee_release_url": "https://gitee.com/dragonMalong/xrd-analyzer/releases/tag/v2.0.2",
   "gitee_download_parts": [
-    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.1/XRD-Analyzer.exe.part1",
-    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.1/XRD-Analyzer.exe.part2"
+    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe.part1",
+    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe.part2"
   ],
-  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.1/XRD-Analyzer.exe",
-  "sha256": "012575622b4acf217f26023d209c2ee496e475066cb3f73d0a90d0a2d5cfbdc8",
-  "published_at": "2026-06-30",
-  "release_notes": "V2.0.1: improves fine-scan fitting speed, preserves fixed-window peak scanning, keeps alpha fast preview, and updates the PyQt5/pyqtgraph release package."
+  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe",
+  "sha256": "a24350c706ec496567a7c1ddc6d692f015e6b17af0d5eebabce22042e05ec1b6",
+  "published_at": "2026-07-02",
+  "release_notes": "V2.0.2: adds the statistics result table, improves imported-data default fit ranges, supports Bruker RAW1.01 supplemental points, and includes the experimental DL super-resolution method."
 }

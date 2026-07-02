@@ -507,26 +507,39 @@ def load_bruker_raw_v3(file_path: str) -> tuple:
     # ── 解析各段 ────────────────────────────────────────────────────────
     offset = _V3_FILE_HDR
     all_x, all_y, ranges_meta = [], [], []
+    raw_variants = set()
+    supplemental_points_total = 0
+    last_data_end = offset
 
     for i in range(n_ranges):
         if offset + _V3_RANGE_HDR > total:
             break
 
         # seg[0:4] = 段头大小(304)，seg[4:8] = n_steps（注意：不是 seg[0]）
+        range_header_size = struct.unpack_from("<I", raw, offset)[0]
+        if not (24 <= range_header_size <= 4096 and offset + range_header_size <= total):
+            range_header_size = _V3_RANGE_HDR
         n_steps    = struct.unpack_from("<I", raw, offset + 4)[0]
         count_time = struct.unpack_from("<f", raw, offset + 4 + 4)[0]  # offset+8 as f32
         start      = struct.unpack_from("<d", raw, offset + 8)[0]
         step       = struct.unpack_from("<d", raw, offset + 16)[0]
+        raw_start  = start
+        raw_step   = step
+        raw_variant = "standard_2theta_degree"
 
         # ── 自动检测 PowDLL SAG-free 变体 ──────────────────────────────
         # 特征：step > 1°（实际是 millidegrees），start < 30°（实际是 theta）
         if step > 1.0 and 0.001 < step / 1000.0 < 1.0:
             step  = step / 1000.0      # millidegrees → degrees
             start = start * 2.0        # theta → 2θ
+            raw_variant = "theta_mdeg"
 
         # 参数合理性校验；失败时尝试备用偏移
         if not _valid(start, step, n_steps):
             start, step, n_steps, count_time = _v3_alt_offsets(raw, offset)
+            raw_start = start
+            raw_step = step
+            raw_variant = "alternate_offsets"
             if not _valid(start, step, n_steps):
                 raise ValueError(
                     f"第 {i+1} 段参数异常 "
@@ -534,15 +547,50 @@ def load_bruker_raw_v3(file_path: str) -> tuple:
                     "文件可能损坏，或为不受支持的仪器子版本。"
                 )
 
-        data_start = offset + _V3_RANGE_HDR
+        data_start = offset + range_header_size
         data_end   = data_start + n_steps * 4
         if data_end > total:
             raise ValueError(f"第 {i+1} 段数据超出文件边界（文件可能被截断）")
 
         counts = list(struct.unpack_from(f"<{n_steps}f", raw, data_start))
-        all_x.extend(start + j * step for j in range(n_steps))
+        supplemental_unit_size = struct.unpack_from("<I", raw, offset + 252)[0]
+        supplemental_bytes = struct.unpack_from("<I", raw, offset + 256)[0]
+        supplemental_counts = []
+        if (
+            supplemental_unit_size == 4
+            and supplemental_bytes > 0
+            and supplemental_bytes % 4 == 0
+            and supplemental_bytes <= 4096
+            and data_end + supplemental_bytes <= total
+        ):
+            extra_n = supplemental_bytes // 4
+            candidate = list(struct.unpack_from(f"<{extra_n}f", raw, data_end))
+            if all(np.isfinite(v) and v >= 0 for v in candidate):
+                supplemental_counts = candidate
+
+        if supplemental_counts:
+            counts.extend(supplemental_counts)
+            data_end += len(supplemental_counts) * 4
+            supplemental_points_total += len(supplemental_counts)
+
+        total_steps = len(counts)
+        all_x.extend(start + j * step for j in range(total_steps))
         all_y.extend(counts)
-        ranges_meta.append(_range_dict(start, step, n_steps, count_time))
+        range_meta = _range_dict(start, step, total_steps, count_time)
+        range_meta.update({
+            "declared_n_steps": int(n_steps),
+            "supplemental_points": int(len(supplemental_counts)),
+            "supplemental_unit_size": int(supplemental_unit_size),
+            "supplemental_bytes": int(supplemental_bytes if supplemental_counts else 0),
+            "raw_variant": raw_variant,
+            "range_header_size": int(range_header_size),
+            "raw_start_field": float(raw_start),
+            "raw_step_field": float(raw_step),
+            "data_offset": int(data_start),
+        })
+        ranges_meta.append(range_meta)
+        raw_variants.add(raw_variant)
+        last_data_end = data_end
         offset = data_end
 
     if not all_x:
@@ -569,6 +617,9 @@ def load_bruker_raw_v3(file_path: str) -> tuple:
         "detector":          None,
         "scan_axis":         None,
         "instrument_id":     None,
+        "raw_variant":       "+".join(sorted(raw_variants)) if raw_variants else None,
+        "supplemental_points": int(supplemental_points_total),
+        "trailing_bytes":    max(0, total - last_data_end),
         "ranges":            ranges_meta,
     }
     return np.array(all_x), np.array(all_y), sample_name, meta

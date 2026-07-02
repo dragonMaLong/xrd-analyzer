@@ -823,16 +823,21 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         if not self.data_loaded:
             return
 
-        angle_min = DEFAULT_ANGLE_MIN
-        angle_max = DEFAULT_ANGLE_MAX
-        self.slider_min.set(angle_min)
-        self.slider_max.set(angle_max)
+        self._refresh_angle_control_bounds()
+        default_state = self._default_analysis_state_for_current_data()
+        angle_min = float(default_state["angle_min"])
+        angle_max = float(default_state["angle_max"])
+        self.slider_min.set(angle_min, emit=False)
+        self.slider_max.set(angle_max, emit=False)
+        self._normalize_angle_range()
         self._refresh_peak_slider_bounds()
         self._save_current_analysis_state()
 
         x = np.asarray(self.x_data, dtype=float)
         y = np.asarray(self.y_data, dtype=float)
         mask = np.isfinite(x) & np.isfinite(y) & (x >= angle_min) & (x <= angle_max)
+        if not np.any(mask):
+            mask = np.isfinite(x) & np.isfinite(y)
         if not np.any(mask):
             return
 
@@ -842,10 +847,49 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
 
         for peak_idx in self.active_peak_indices:
             if peak_idx == 0 and peak_idx < len(self.peak_mu_sliders):
-                self.peak_mu_sliders[peak_idx].set(peak_center)
+                self.peak_mu_sliders[peak_idx].set(peak_center, emit=False)
                 break
         self._save_current_peak_states()
         self._save_current_analysis_state()
+
+    def _data_angle_bounds(self) -> tuple[float, float]:
+        if getattr(self, "data_loaded", False) and hasattr(self, "x_data"):
+            try:
+                x = np.asarray(self.x_data, dtype=float)
+                finite = x[np.isfinite(x)]
+                if finite.size:
+                    low = float(np.nanmin(finite))
+                    high = float(np.nanmax(finite))
+                    if high > low:
+                        return low, high
+            except Exception:
+                pass
+        return float(DEFAULT_ANGLE_MIN), float(DEFAULT_ANGLE_MAX)
+
+    def _refresh_angle_control_bounds(self) -> None:
+        if not hasattr(self, "slider_min") or not hasattr(self, "slider_max"):
+            return
+        low, high = self._data_angle_bounds()
+        if high <= low:
+            high = low + 0.01
+        self.slider_min.config(from_=low, to=high)
+        self.slider_max.config(from_=low, to=high)
+
+    def _default_analysis_state_for_current_data(self) -> dict[str, float]:
+        low, high = self._data_angle_bounds()
+        span = high - low
+        if span > 20.0:
+            angle_min = low + 10.0
+            angle_max = high - 10.0
+        elif span > 0.02:
+            margin = min(span * 0.25, max(0.0, span / 2.0 - 0.01))
+            angle_min = low + margin
+            angle_max = high - margin
+        else:
+            angle_min, angle_max = low, high
+        if angle_max <= angle_min:
+            angle_min, angle_max = low, high
+        return {"angle_min": round(float(angle_min), 2), "angle_max": round(float(angle_max), 2)}
 
     def load_file(self):
         """Open BET-style import dialog and load selected XRD files."""
@@ -1211,6 +1255,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.data_loaded = True
         self.current_file_name = sample.name
         self.current_metadata = sample.metadata
+        had_analysis_state = bool(sample.analysis_state)
+        self._refresh_angle_control_bounds()
         if sample.peak_states is None:
             sample.peak_states = self._default_peak_states()
         if sample.analysis_state:
@@ -1222,7 +1268,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                     {"angle_min": float(np.nanmin(x_segment)), "angle_max": float(np.nanmax(x_segment))}
                 )
         else:
-            self._apply_analysis_state({"angle_min": DEFAULT_ANGLE_MIN, "angle_max": DEFAULT_ANGLE_MAX})
+            self._apply_analysis_state(self._default_analysis_state_for_current_data())
         self._apply_peak_states(sample.peak_states)
         self._apply_manual_baseline_state(sample.baseline_state)
         self._apply_marker_label_state(sample.marker_label_state)
@@ -1238,7 +1284,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.results_ready = False
             self._fit_cache = None
             self.clear_result_table()
-            if not sample.analysis_state:
+            if not had_analysis_state:
                 self._set_default_import_range_and_peak()
             self.update_preview(None)
         self._save_current_analysis_state()

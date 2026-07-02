@@ -506,9 +506,18 @@ class ControlPanelMixin:
         self.sample_result_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        self.sample_stats_table = self._make_detail_table(["粒径区间", "百分比"])
+        self.sample_stats_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.sample_stats_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self.sample_stats_table.horizontalHeader().setStretchLastSection(True)
+        self.sample_stats_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.sample_stats_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self._install_table_copy_menu(self.sample_stats_table)
         self.sample_detail_tabs.addTab(self.sample_param_table, "样品")
         self.sample_detail_tabs.addTab(self.sample_result_table, "计算结果")
+        self.sample_detail_tabs.addTab(self.sample_stats_table, "统计结果")
         parent_layout.addWidget(self.sample_detail_tabs, 2)
+        self.update_statistics_table()
 
     @staticmethod
     def _make_detail_table(headers: list[str]) -> QtWidgets.QTableWidget:
@@ -551,6 +560,45 @@ class ControlPanelMixin:
         if alignment is not None:
             item.setTextAlignment(alignment)
         return item
+
+    def _install_table_copy_menu(self, table: QtWidgets.QTableWidget) -> None:
+        table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        copy_action = QtWidgets.QAction("复制", table)
+        copy_action.setShortcut(QtGui.QKeySequence.Copy)
+        copy_action.triggered.connect(lambda _checked=False, t=table: self._copy_table_selection_to_clipboard(t))
+        table.addAction(copy_action)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table: self._show_table_copy_menu(t, pos)
+        )
+
+    def _show_table_copy_menu(self, table: QtWidgets.QTableWidget, pos: QtCore.QPoint) -> None:
+        if not table.selectedIndexes():
+            item = table.itemAt(pos)
+            if item is not None:
+                table.setCurrentItem(item)
+                item.setSelected(True)
+        if not table.selectedIndexes():
+            return
+        menu = QtWidgets.QMenu(table)
+        copy_action = menu.addAction("复制")
+        copy_action.triggered.connect(lambda _checked=False, t=table: self._copy_table_selection_to_clipboard(t))
+        menu.exec_(table.viewport().mapToGlobal(pos))
+
+    def _copy_table_selection_to_clipboard(self, table: QtWidgets.QTableWidget) -> None:
+        indexes = table.selectedIndexes()
+        if not indexes:
+            return
+        rows = sorted({idx.row() for idx in indexes})
+        cols = sorted({idx.column() for idx in indexes})
+        selected = {(idx.row(), idx.column()) for idx in indexes}
+        lines = []
+        for row in rows:
+            values = []
+            for col in cols:
+                item = table.item(row, col)
+                values.append(item.text() if item is not None and (row, col) in selected else "")
+            lines.append("\t".join(values))
+        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
 
     def _build_analysis_controls(self, parent: QtWidgets.QWidget | None = None) -> QtWidgets.QWidget:
         panel = QtWidgets.QFrame(parent)
@@ -826,6 +874,7 @@ class ControlPanelMixin:
         algorithm_combo.addItem("平滑 L2（当前默认）", "l2")
         algorithm_combo.addItem("TV 高分辨（实验）", "tv")
         algorithm_combo.addItem("L2+TV 混合（实验）", "hybrid")
+        algorithm_combo.addItem("DL 超分辨（实验）", "dl_sr")
         current_algorithm = str(getattr(self, "regularization_method", "l2") or "l2").lower()
         index = algorithm_combo.findData(current_algorithm)
         algorithm_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1325,6 +1374,7 @@ class ControlPanelMixin:
     def clear_result_table(self) -> None:
         if hasattr(self, "sample_result_table"):
             self.sample_result_table.setRowCount(0)
+        self.update_statistics_table()
 
     def update_result_table(self) -> None:
         if not hasattr(self, "sample_result_table"):
@@ -1344,6 +1394,89 @@ class ControlPanelMixin:
                     font.setBold(True)
                     item.setFont(font)
                 self.sample_result_table.setItem(row, col, item)
+        self.update_statistics_table()
+
+    def update_statistics_table(self) -> None:
+        if not hasattr(self, "sample_stats_table"):
+            return
+        rows = self._statistics_rows()
+        self.sample_stats_table.setRowCount(len(rows))
+        for row, (interval, percentage) in enumerate(rows):
+            self.sample_stats_table.setItem(row, 0, self._detail_table_item(interval))
+            self.sample_stats_table.setItem(
+                row,
+                1,
+                self._detail_table_item(percentage, alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter),
+            )
+
+    def _statistics_rows(self) -> list[tuple[str, str]]:
+        intervals = self._particle_size_intervals()
+        percentages = self._particle_size_interval_percentages()
+        if not percentages:
+            return [(label, "") for label, _left, _right in intervals]
+        return [(label, percentages.get(label, "0.00%")) for label, _left, _right in intervals]
+
+    @staticmethod
+    def _particle_size_intervals() -> list[tuple[str, float, float]]:
+        intervals = [("＜1", 0.0, 1.0)]
+        intervals.extend((f"{i}-{i + 1}", float(i), float(i + 1)) for i in range(1, 100))
+        return intervals
+
+    def _particle_size_interval_percentages(self) -> dict[str, str]:
+        if not getattr(self, "results_ready", False):
+            return {}
+        D_range = np.asarray(getattr(self, "D_range", []), dtype=float)
+        peak_infos = list(getattr(self, "all_peak_info", []) or [])
+        if D_range.size < 2 or not peak_infos:
+            return {}
+        global_y = np.zeros_like(D_range, dtype=float)
+        for info in peak_infos:
+            f_segment = np.asarray(info.get("f_segment", []), dtype=float)
+            if f_segment.size == D_range.size:
+                global_y += np.nan_to_num(f_segment, nan=0.0, posinf=0.0, neginf=0.0)
+        global_y = np.clip(global_y, 0.0, None)
+        if not np.any(global_y > 0):
+            return {}
+        denominator = self._integrate_distribution_interval(
+            D_range,
+            global_y,
+            float(np.nanmin(D_range)),
+            float(np.nanmax(D_range)),
+        )
+        if denominator <= 0:
+            denominator = float(np.sum(global_y))
+        if denominator <= 0:
+            return {}
+        percentages: dict[str, str] = {}
+        for label, left, right in self._particle_size_intervals():
+            area = self._integrate_distribution_interval(D_range, global_y, left, right)
+            pct = max(0.0, area / denominator * 100.0)
+            percentages[label] = f"{pct:.2f}%"
+        return percentages
+
+    @staticmethod
+    def _integrate_distribution_interval(x_values, y_values, left: float, right: float) -> float:
+        x = np.asarray(x_values, dtype=float)
+        y = np.asarray(y_values, dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+        if x.size < 2 or right <= left:
+            return 0.0
+        order = np.argsort(x)
+        x = x[order]
+        y = np.clip(y[order], 0.0, None)
+        lo = max(float(left), float(x[0]))
+        hi = min(float(right), float(x[-1]))
+        if hi <= lo:
+            return 0.0
+        inner = (x > lo) & (x < hi)
+        xs = np.concatenate(([lo], x[inner], [hi]))
+        ys = np.interp(xs, x, y)
+        try:
+            return float(np.trapezoid(ys, xs))
+        except AttributeError:
+            return float(np.trapz(ys, xs))
 
     def _result_rows(self) -> list[tuple[str, str, str, str, str, str]]:
         if not getattr(self, "results_ready", False):
