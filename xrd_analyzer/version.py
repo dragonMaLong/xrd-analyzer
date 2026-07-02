@@ -1,3 +1,3 @@
 """Application version for the PyQt5 XRD analyzer."""
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
