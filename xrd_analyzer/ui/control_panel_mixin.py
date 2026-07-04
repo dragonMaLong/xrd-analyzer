@@ -874,10 +874,25 @@ class ControlPanelMixin:
         algorithm_combo.addItem("平滑 L2（当前默认）", "l2")
         algorithm_combo.addItem("TV 高分辨（实验）", "tv")
         algorithm_combo.addItem("L2+TV 混合（实验）", "hybrid")
-        algorithm_combo.addItem("DL 超分辨（实验）", "dl_sr")
         current_algorithm = str(getattr(self, "regularization_method", "l2") or "l2").lower()
+        if current_algorithm in {"elastic_net", "dl_sr", "deep_sr", "deep_learning", "super_resolution", "sparse"}:
+            current_algorithm = "l2"
         index = algorithm_combo.findData(current_algorithm)
         algorithm_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        kernel_combo = QtWidgets.QComboBox(dialog)
+        kernel_combo.addItem("Pearson VII（默认）", "pearson7")
+        kernel_combo.addItem("Sphere 球形晶粒（实验）", "sphere")
+        current_kernel = str(getattr(self, "peak_kernel", "pearson7") or "pearson7").lower()
+        kernel_index = kernel_combo.findData(current_kernel)
+        kernel_combo.setCurrentIndex(kernel_index if kernel_index >= 0 else 0)
+
+        distribution_combo = QtWidgets.QComboBox(dialog)
+        distribution_combo.addItem("体积分布（默认）", "volume")
+        distribution_combo.addItem("数量分布", "number")
+        current_distribution = str(getattr(self, "size_distribution_mode", "volume") or "volume").lower()
+        distribution_index = distribution_combo.findData(current_distribution)
+        distribution_combo.setCurrentIndex(distribution_index if distribution_index >= 0 else 0)
 
         for spin in (d_min_spin, d_max_spin, fwhm_spin):
             spin.setKeyboardTracking(False)
@@ -895,8 +910,12 @@ class ControlPanelMixin:
             " background: white; font: 8pt 'Microsoft YaHei'; }"
         )
         d_step_combo.setStyleSheet(algorithm_combo.styleSheet())
+        kernel_combo.setStyleSheet(algorithm_combo.styleSheet())
+        distribution_combo.setStyleSheet(algorithm_combo.styleSheet())
 
         form.addRow("正则算法", algorithm_combo)
+        form.addRow("峰形核函数", kernel_combo)
+        form.addRow("分布显示", distribution_combo)
         form.addRow("最小粒径", d_min_field)
         form.addRow("最大粒径", d_max_field)
         form.addRow("粒径步长", d_step_combo)
@@ -932,6 +951,12 @@ class ControlPanelMixin:
             self.particle_size_step = float(d_step_combo.currentData() or 0.1)
             self.instrument_fwhm = float(fwhm_spin.value())
             self.regularization_method = str(algorithm_combo.currentData() or "l2")
+            self.peak_kernel = str(kernel_combo.currentData() or "pearson7")
+            distribution_mode = str(distribution_combo.currentData() or "volume")
+            if hasattr(self, "_set_size_distribution_mode"):
+                self._set_size_distribution_mode(distribution_mode)
+            else:
+                self.size_distribution_mode = distribution_mode
             return True
 
         def accept_dialog() -> None:

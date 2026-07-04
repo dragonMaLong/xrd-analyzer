@@ -216,6 +216,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.particle_size_step = 0.1
         self.instrument_fwhm = 0.0
         self.regularization_method = "l2"
+        self.peak_kernel = "pearson7"
         self.marker_label_state = {}
         self.plot_view_state = {}
         self.peak_mu_rects_preview = []
@@ -642,6 +643,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             ("d_step", round(float(params.get("d_step", 0.0)), 8)),
             ("instrument_fwhm", round(float(params.get("instrument_fwhm", 0.0)), 8)),
             ("regularization_method", str(params.get("regularization_method", "l2")).lower()),
+            ("peak_kernel", str(params.get("peak_kernel", "pearson7") or "pearson7").lower()),
             ("active_peak_indices", tuple(int(i) for i in params.get("active_peak_indices", []))),
             ("mu_centers", tuple(round(float(v), 8) for v in mu_values)),
             ("baseline_state", self._signature_value(params.get("baseline_state"))),
@@ -680,6 +682,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             "alpha": float(alpha_val),
             "last_resid": float(resid),
             "regularization_method": str(params.get("regularization_method", "l2") or "l2").lower(),
+            "peak_kernel": str(params.get("peak_kernel", "pearson7") or "pearson7").lower(),
             "active_peak_indices": list(params.get("active_peak_indices", [])),
             "best_mu": [float(v) for v in best_mu],
             "sample_key": str(params.get("sample_key") or self._current_sample_key()),
@@ -720,6 +723,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             "n_peaks": n_peaks,
             "alpha": float(self.slider_alpha.get()),
             "regularization_method": str(cache.get("regularization_method", "l2") or "l2").lower(),
+            "peak_kernel": str(cache.get("peak_kernel", "pearson7") or "pearson7").lower(),
             "active_peak_indices": list(cache.get("active_peak_indices") or []),
         }
 
@@ -785,6 +789,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
 
             self.best_f_total = np.asarray(f_total, dtype=float)
             self.result_regularization_method = request["regularization_method"]
+            self.result_peak_kernel = request.get("peak_kernel", "pearson7")
             self.result_active_peak_indices = list(request["active_peak_indices"])
             if isinstance(getattr(self, "_fit_cache", None), dict):
                 self._fit_cache["alpha"] = float(request["alpha"])
@@ -814,6 +819,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             "alpha": float(self.slider_alpha.get()),
             "instrument_fwhm": float(getattr(self, "instrument_fwhm", 0.0)),
             "regularization_method": str(getattr(self, "regularization_method", "l2")),
+            "peak_kernel": str(getattr(self, "peak_kernel", "pearson7") or "pearson7"),
             "active_peak_indices": list(fit_peak_indices),
             "baseline_state": self._current_manual_baseline_state(),
         }
@@ -1307,6 +1313,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             "global_max_component_area": self.global_max_component_area,
             "result_active_peak_indices": self.result_active_peak_indices,
             "result_regularization_method": getattr(self, "result_regularization_method", "l2"),
+            "result_peak_kernel": getattr(self, "result_peak_kernel", "pearson7"),
             "x_segment": self.x_segment,
             "y_segment_raw": self.y_segment_raw,
             "y_segment": self.y_segment,
@@ -1347,6 +1354,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         alpha_val,
         inst_fwhm,
         progress_state: dict,
+        peak_kernel: str = "pearson7",
     ):
         args_common = (
             tuple(base_mu),
@@ -1360,6 +1368,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             D_range,
             alpha_val,
             inst_fwhm,
+            peak_kernel,
         )
         futs = [executor.submit(_eval_candidate_for_index, float(mu), *args_common) for mu in candidates]
         pending = set(futs)
@@ -1470,6 +1479,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             alpha_val = float(params["alpha"])
             inst_fwhm = float(params["instrument_fwhm"])
             regularization_method = str(params.get("regularization_method", "l2") or "l2").lower()
+            peak_kernel = str(params.get("peak_kernel", "pearson7") or "pearson7").lower()
 
             if mode == "fast":
                 halfwidth, steps = 0.0, 0
@@ -1529,6 +1539,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                     scan_D_range,
                     alpha_val,
                     inst_fwhm,
+                    peak_kernel,
                 )
                 future_counts = {
                     ex.submit(
@@ -1598,6 +1609,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 alpha_val,
                 instrument_fwhm_deg=inst_fwhm,
                 regularization_method=regularization_method,
+                kernel=peak_kernel,
             )
             stopped = False
             try:
@@ -1633,6 +1645,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.y_segment = y
             self.background = background
             self.result_regularization_method = regularization_method
+            self.result_peak_kernel = peak_kernel
             self._fit_cache = self._build_fit_cache(
                 params,
                 best_mu,

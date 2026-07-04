@@ -10,9 +10,11 @@ import numpy as np
 from scipy.optimize import minimize, nnls
 from scipy.sparse import diags
 from scipy.linalg import block_diag
+from scipy.special import gammaln
 
 from .peak_functions import (
     pearson_vii_numba,
+    sphere_interference_profile,
     calc_peak_params_numba,
     calc_kalpha2_position,
     precompile_numba_functions,
@@ -52,10 +54,49 @@ def build_regularization_matrix(n_d_points: int) -> np.ndarray:
     return diags([-1, 1], [0, 1], shape=(n_d_points - 1, n_d_points)).toarray()
 
 
+def _pearson_vii_area(gamma, m):
+    gamma = np.asarray(gamma, dtype=float)
+    m = np.asarray(m, dtype=float)
+    safe_m = np.maximum(m, 1.0)
+    area = gamma * np.sqrt(np.pi) * np.exp(gammaln(safe_m - 0.5) - gammaln(safe_m))
+    return np.where(np.isfinite(area) & (area > 1e-15), area, 1.0)
+
+
+def _normalize_columns_by_trapz(profile, x):
+    profile = np.asarray(profile, dtype=float)
+    x = np.asarray(x, dtype=float)
+    try:
+        area = np.abs(np.trapezoid(profile, x, axis=0))
+    except AttributeError:
+        area = np.abs(np.trapz(profile, x, axis=0))
+    area = np.where(np.isfinite(area) & (area > 1e-15), area, 1.0)
+    return profile / area[None, :]
+
+
 def build_peak_basis(x, mu, D_range, lam1, lam2,
                      intensity_ratio=INTENSITY_RATIO,
-                     instrument_fwhm_deg=0.0):
+                     instrument_fwhm_deg=0.0,
+                     kernel: str = "pearson7"):
+    """Build one peak's Kα1/Kα2 basis blocks.
+
+    The default Pearson VII columns are area-normalized analytically, so each
+    NNLS coefficient represents a volume contribution on the D grid. Kα2 is
+    normalized with its own width/shape first, then scaled by the integrated
+    intensity ratio.
+    """
     mu_ka2 = calc_kalpha2_position(mu, lam1, lam2)
+
+    kernel_key = str(kernel or "pearson7").lower()
+    if kernel_key == "sphere":
+        pk1 = _normalize_columns_by_trapz(
+            sphere_interference_profile(x, mu, D_range, lam1),
+            x,
+        )
+        pk2 = _normalize_columns_by_trapz(
+            sphere_interference_profile(x, mu_ka2, D_range, lam2),
+            x,
+        ) * intensity_ratio
+        return pk1, pk2
 
     gamma1, m1 = calc_peak_params_numba(
         mu, lam1, D_range, SLOPE_M, M_REF_MIN, D_REF_MAX,
@@ -66,14 +107,16 @@ def build_peak_basis(x, mu, D_range, lam1, lam2,
         instrument_fwhm_deg,
     )
 
-    pk1 = pearson_vii_numba(x, mu, gamma1, m1)
-    pk2 = pearson_vii_numba(x, mu_ka2, gamma2, m2) * intensity_ratio
+    pk1 = pearson_vii_numba(x, mu, gamma1, m1) / _pearson_vii_area(gamma1, m1)[None, :]
+    pk2 = pearson_vii_numba(x, mu_ka2, gamma2, m2) / _pearson_vii_area(gamma2, m2)[None, :]
+    pk2 = pk2 * intensity_ratio
     return pk1, pk2
 
 
 def build_basis_matrix(x, mu_list, D_range, lam1, lam2,
                         intensity_ratio=INTENSITY_RATIO,
-                        instrument_fwhm_deg=0.0):
+                        instrument_fwhm_deg=0.0,
+                        kernel: str = "pearson7"):
     """
     为给定的峰位列表构建完整基函数矩阵，同时返回各峰的 k1/k2 子矩阵。
 
@@ -100,6 +143,7 @@ def build_basis_matrix(x, mu_list, D_range, lam1, lam2,
         pk1, pk2 = build_peak_basis(
             x, mu, D_range, lam1, lam2, intensity_ratio,
             instrument_fwhm_deg,
+            kernel,
         )
 
         basis_k1_list.append(pk1)
@@ -257,124 +301,70 @@ def solve_hybrid_regularized(
     return f_total, resid
 
 
-def _moving_average_1d(values, radius: int):
-    radius = int(radius)
-    if radius <= 0 or len(values) <= 2:
-        return np.asarray(values, dtype=float)
-    kernel = np.ones(radius * 2 + 1, dtype=float)
-    kernel /= kernel.sum()
-    padded = np.pad(np.asarray(values, dtype=float), radius, mode="edge")
-    return np.convolve(padded, kernel, mode="valid")
-
-
-def _deep_sr_prior(f_total, n_peaks: int, n_d: int, alpha: float):
-    """Build an untrained deep-prior style super-resolution target."""
-    f_total = np.asarray(f_total, dtype=float)
-    if f_total.size != int(n_peaks) * int(n_d):
-        return np.clip(f_total, 0.0, None)
-
-    alpha_val = max(float(alpha), 1e-6)
-    detail_gain = 0.28 + 0.22 / np.sqrt(alpha_val + 0.25)
-    shrink_ratio = 0.004 + 0.010 / np.sqrt(alpha_val + 0.25)
-    rows = np.clip(f_total.reshape(int(n_peaks), int(n_d)), 0.0, None)
-    prior_rows = []
-
-    for row in rows:
-        original_area = float(np.sum(row))
-        if original_area <= 1e-14 or not np.isfinite(row).all():
-            prior_rows.append(np.zeros_like(row))
-            continue
-
-        current = row.copy()
-        for layer in range(4):
-            fine = _moving_average_1d(current, 1)
-            coarse = _moving_average_1d(current, 3 + layer)
-            detail = fine - coarse
-            local_scale = max(float(np.nanmax(fine)), 1e-12)
-            gate = np.tanh(detail / (0.08 * local_scale + 1e-12))
-            current = current * (1.0 + detail_gain * np.maximum(gate, 0.0))
-            current += 0.18 * detail_gain * np.maximum(detail, 0.0)
-            current = np.maximum(current - shrink_ratio * local_scale, 0.0)
-            area = float(np.sum(current))
-            if area > 1e-14:
-                current *= original_area / area
-
-        current = 0.80 * current + 0.20 * _moving_average_1d(current, 1)
-        area = float(np.sum(current))
-        if area > 1e-14:
-            current *= original_area / area
-        prior_rows.append(np.clip(current, 0.0, None))
-
-    return np.ravel(np.asarray(prior_rows, dtype=float))
-
-
-def solve_deep_super_resolution(
+def solve_elastic_net_regularized(
     basis_total,
     y_scaled,
     L_single,
     n_peaks,
     alpha,
     *,
-    max_iter: int = 220,
+    l1_ratio: float = 0.3,
+    max_iter: int = 300,
 ):
-    """Experimental dependency-free deep-prior super-resolution solver."""
+    """
+    Elastic-net sparse non-negative regularized solver.
+
+    Objective:
+        0.5 * ||A f - y||²
+        + 0.5 * (alpha * (1 - l1_ratio))² * ||L f||²
+        + alpha * l1_ratio * c * sum(f)
+
+    Under the non-negative bounds, sum(f) is the L1 norm and its gradient is
+    constant. The L1 term promotes sparse size components and suppresses the
+    long Tikhonov tails; this is the standard LASSO / elastic-net idea from
+    inverse problems and follows Zou & Hastie (2005).
+    """
     basis_total = np.asarray(basis_total, dtype=float)
     y_scaled = np.asarray(y_scaled, dtype=float)
     n_peaks = int(n_peaks)
-    n_d = int(L_single.shape[1])
-    alpha_val = max(float(alpha), 1e-6)
+    alpha_val = max(float(alpha), 1e-12)
+    ratio = float(np.clip(float(l1_ratio), 0.0, 1.0))
 
     try:
-        x0, _ = solve_hybrid_regularized(
-            basis_total,
-            y_scaled,
-            L_single,
-            n_peaks,
-            alpha,
-            tv_ratio=0.08,
-            max_iter=120,
-        )
-    except Exception:
         x0, _ = solve_nnls_regularized(basis_total, y_scaled, L_single, n_peaks, alpha)
+    except Exception:
+        x0 = np.zeros(basis_total.shape[1], dtype=float)
     x0 = np.asarray(x0, dtype=float)
     if x0.size != basis_total.shape[1] or not np.isfinite(x0).all():
         x0 = np.zeros(basis_total.shape[1], dtype=float)
 
-    prior = _deep_sr_prior(x0, n_peaks, n_d, alpha_val)
-    if prior.size != x0.size or not np.isfinite(prior).all():
-        prior = np.clip(x0, 0.0, None)
-    start = np.maximum(0.65 * x0 + 0.35 * prior, 0.0)
-
     L_combined = block_diag(*([L_single] * n_peaks))
-    col_norm = np.sum(basis_total * basis_total, axis=0)
-    col_scale = max(float(np.nanmedian(col_norm)), 1e-12)
-    smooth_weight = (0.10 * alpha_val) ** 2
-    prior_weight = col_scale * (0.045 + 0.025 * np.log10(alpha_val + 1.0))
-    positive = start[start > 0]
-    sparse_scale = float(np.nanmedian(positive)) if positive.size else 1.0
-    sparse_scale = max(sparse_scale, 1e-12)
-    sparse_weight = col_scale * sparse_scale * (0.0015 / np.sqrt(alpha_val + 0.25))
+    column_norms = np.linalg.norm(basis_total, axis=0)
+    scale = float(np.nanmedian(column_norms[np.isfinite(column_norms)])) if column_norms.size else 1.0
+    scale = max(scale, 1e-12)
+    l2_weight = (alpha_val * (1.0 - ratio)) ** 2
+    l1_weight = alpha_val * ratio * scale
 
     def objective_and_grad(f):
         f = np.asarray(f, dtype=float)
         residual = basis_total.dot(f) - y_scaled
         diff = L_combined.dot(f)
-        prior_diff = f - prior
-        f_nonneg = np.maximum(f, 0.0)
         obj = 0.5 * float(residual.dot(residual))
-        obj += 0.5 * smooth_weight * float(diff.dot(diff))
-        obj += 0.5 * prior_weight * float(prior_diff.dot(prior_diff))
-        obj += sparse_weight * float(np.sum(np.log1p(f_nonneg / sparse_scale)))
+        if l2_weight > 0.0:
+            obj += 0.5 * l2_weight * float(diff.dot(diff))
+        if l1_weight > 0.0:
+            obj += l1_weight * float(np.sum(f))
 
         grad = basis_total.T.dot(residual)
-        grad += smooth_weight * L_combined.T.dot(diff)
-        grad += prior_weight * prior_diff
-        grad += sparse_weight / (sparse_scale + f_nonneg)
+        if l2_weight > 0.0:
+            grad += l2_weight * L_combined.T.dot(diff)
+        if l1_weight > 0.0:
+            grad += l1_weight
         return obj, grad
 
     result = minimize(
         objective_and_grad,
-        start,
+        np.clip(x0, 0.0, None),
         method="L-BFGS-B",
         jac=True,
         bounds=[(0.0, None)] * int(basis_total.shape[1]),
@@ -407,8 +397,15 @@ def solve_regularized_from_basis(
         return solve_hybrid_regularized(
             basis_total, y_scaled, L_single, n_peaks, alpha
         )
-    if method in {"dl_sr", "deep_sr", "deep_learning", "super_resolution"}:
-        return solve_deep_super_resolution(
+    if method in {
+        "elastic_net",
+        "sparse",
+        "dl_sr",
+        "deep_sr",
+        "deep_learning",
+        "super_resolution",
+    }:
+        return solve_elastic_net_regularized(
             basis_total, y_scaled, L_single, n_peaks, alpha
         )
     if method == "tv":
@@ -423,7 +420,8 @@ def solve_regularized_from_basis(
 def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
                      intensity_ratio=INTENSITY_RATIO,
                      instrument_fwhm_deg=0.0,
-                     regularization_method: str = "l2"):
+                     regularization_method: str = "l2",
+                     kernel: str = "pearson7"):
     """
     给定峰位列表，完整执行一次正则化 NNLS 拟合。
 
@@ -436,7 +434,8 @@ def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
     """
     basis_total, basis_k1_list, basis_k2_list = build_basis_matrix(
         x, mu_list, D_range, lam1, lam2, intensity_ratio,
-        instrument_fwhm_deg
+        instrument_fwhm_deg,
+        kernel,
     )
     f_total, resid = solve_regularized_from_basis(
         basis_total,
@@ -457,7 +456,8 @@ def fit_with_mu_list(x, y_scaled, mu_list, lam1, lam2, L_single, D_range, alpha,
 
 def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
                               L_single, D_range, alpha_val,
-                              instrument_fwhm_deg=0.0):
+                              instrument_fwhm_deg=0.0,
+                              kernel: str = "pearson7"):
     """
     无 self 版本：供子进程使用的 NNLS 拟合入口。
 
@@ -467,7 +467,8 @@ def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
 
     basis_total, _, _ = build_basis_matrix(
         x, mu_list, D_range, lam1, lam2, intensity_ratio,
-        instrument_fwhm_deg
+        instrument_fwhm_deg,
+        kernel,
     )
     f_total, resid = solve_nnls_regularized(
         basis_total, y_scaled, L_single, len(mu_list), alpha_val
@@ -480,7 +481,8 @@ def _fit_with_mu_list_worker(x, y_scaled, mu_list, lam1, lam2, intensity_ratio,
 def _eval_candidate_chunk_for_index(candidates, base_mu, peak_idx,
                                     x, y_scaled, lam1, lam2, intensity_ratio,
                                     L_single, D_range, alpha_val,
-                                    instrument_fwhm_deg=0.0):
+                                    instrument_fwhm_deg=0.0,
+                                    kernel: str = "pearson7"):
     """
     Evaluate several candidate positions for one peak.
 
@@ -507,6 +509,7 @@ def _eval_candidate_chunk_for_index(candidates, base_mu, peak_idx,
         pk1, pk2 = build_peak_basis(
             x, mu, D_range, lam1, lam2, intensity_ratio,
             instrument_fwhm_deg,
+            kernel,
         )
         basis_total[:, idx * n_d:(idx + 1) * n_d] = pk1 + pk2
 
@@ -516,6 +519,7 @@ def _eval_candidate_chunk_for_index(candidates, base_mu, peak_idx,
             pk1, pk2 = build_peak_basis(
                 x, mu_val, D_range, lam1, lam2, intensity_ratio,
                 instrument_fwhm_deg,
+                kernel,
             )
             basis_total[:, current_slice] = pk1 + pk2
             f_total, resid = solve_nnls_regularized(
@@ -532,7 +536,8 @@ def _eval_candidate_chunk_for_index(candidates, base_mu, peak_idx,
 def _eval_candidate_for_index(mu_val, base_mu, peak_idx,
                                x, y_scaled, lam1, lam2, intensity_ratio,
                                L_single, D_range, alpha_val,
-                               instrument_fwhm_deg=0.0):
+                               instrument_fwhm_deg=0.0,
+                               kernel: str = "pearson7"):
     """
     将第 peak_idx 个峰的 μ 替换为 mu_val，评估残差。
     供 ProcessPoolExecutor 并行扫描峰位时使用。
@@ -543,6 +548,6 @@ def _eval_candidate_for_index(mu_val, base_mu, peak_idx,
     trial[peak_idx] = mu_val
     loss, _ = _fit_with_mu_list_worker(
         x, y_scaled, trial, lam1, lam2, intensity_ratio,
-        L_single, D_range, alpha_val, instrument_fwhm_deg
+        L_single, D_range, alpha_val, instrument_fwhm_deg, kernel
     )
     return loss, mu_val
