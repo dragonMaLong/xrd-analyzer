@@ -8,6 +8,33 @@ import numpy as np
 from scipy.signal import find_peaks
 
 
+def volume_to_number_distribution(f, D):
+    """
+    Convert a volume-weighted size distribution to a number-weighted one.
+
+    Assumes spherical crystallites, so one particle's volume is proportional
+    to D^3. The returned array is clipped non-negative and normalized to sum 1.
+    """
+    f_arr = np.clip(np.asarray(f, dtype=float), 0.0, None)
+    D_arr = np.asarray(D, dtype=float)
+    safe_D = np.where(np.isfinite(D_arr) & (D_arr > 0.0), D_arr, np.nan)
+    number = f_arr / np.maximum(safe_D ** 3.0, 1e-30)
+    number = np.nan_to_num(number, nan=0.0, posinf=0.0, neginf=0.0)
+    total = float(np.sum(number))
+    return number / total if total > 0.0 else np.zeros_like(f_arr)
+
+
+def _weighted_mean_and_mode(D_range, weights):
+    D = np.asarray(D_range, dtype=float)
+    w = np.clip(np.asarray(weights, dtype=float), 0.0, None)
+    total = float(np.sum(w))
+    if D.size == 0 or w.size != D.size or total <= 0.0:
+        return None, None
+    mean = float(np.sum(D * w) / total)
+    mode = float(D[int(np.nanargmax(w))])
+    return mean, mode
+
+
 # ---------------------------------------------------------------------------
 # 单峰分析
 # ---------------------------------------------------------------------------
@@ -80,6 +107,9 @@ def build_all_peak_info(best_f_total: np.ndarray,
     Returns
     -------
     all_peak_info      : list[dict]
+        Each dict includes volume_dist / number_dist plus their own
+        volume_mean / number_mean and volume_mode / number_mode. Means and
+        modes should be interpreted with the matching weighting only.
     global_max_area    : float — 所有局部组分中面积最大值（用于全局归一化）
     """
     all_peak_info = []
@@ -90,6 +120,10 @@ def build_all_peak_info(best_f_total: np.ndarray,
         f_peak = f_segments[i]
         if f_peak.sum() == 0:
             continue
+        volume_dist = np.clip(np.asarray(f_peak, dtype=float), 0.0, None)
+        number_dist = volume_to_number_distribution(volume_dist, D_range)
+        volume_mean, volume_mode = _weighted_mean_and_mode(D_range, volume_dist)
+        number_mean, number_mode = _weighted_mean_and_mode(D_range, number_dist)
 
         max_val = f_peak.max()
         normalized_dist = f_peak / max_val if max_val > 0 else np.zeros_like(f_peak)
@@ -99,6 +133,12 @@ def build_all_peak_info(best_f_total: np.ndarray,
 
         all_peak_info.append({
             "f_segment":      f_peak,
+            "volume_dist":    volume_dist,
+            "number_dist":    number_dist,
+            "volume_mean":    volume_mean,
+            "volume_mode":    volume_mode,
+            "number_mean":    number_mean,
+            "number_mode":    number_mode,
             "normalized_dist": normalized_dist,
             "peak_details":   peak_details,
             "color":          peak_colors[active_peak_indices[i]],

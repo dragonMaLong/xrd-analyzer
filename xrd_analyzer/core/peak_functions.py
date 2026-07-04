@@ -24,11 +24,11 @@ WAVELENGTHS: dict = {
 SCHERRER_K: float = 0.9
 
 #: Pearson VII m 参数映射常量
-#:   D = D_REF_MAX (100 nm) → m = M_REF_MIN (0.5, 洛伦兹极限)
+#:   D = D_REF_MAX (100 nm) → m = M_REF_MIN (1.0, 可积洛伦兹极限)
 #:   D → 0              → m → 5.0   (接近高斯)
-M_REF_MIN: float = 0.5
+M_REF_MIN: float = 1.0
 D_REF_MAX: float = 100.0
-SLOPE_M: float = (5.0 - M_REF_MIN) / (0.5 - D_REF_MAX)  # ≈ -0.04523
+SLOPE_M: float = (5.0 - M_REF_MIN) / (0.5 - D_REF_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,31 @@ def pearson_vii_numba(xvals, mu, gamma, m):
     return (1.0 + ((x - mu) / gamma_arr) ** 2.0) ** (-m_arr)
 
 
+def sphere_interference_profile(xvals, mu, D, wavelength):
+    """
+    Spherical-crystallite interference kernel.
+
+    This uses the squared sphere form factor, equivalent to the Fourier
+    transform of the spherical common-volume function used in WPPM-style
+    line-profile models. The returned profile is unit height; callers should
+    area-normalize it on their chosen 2theta grid.
+    """
+    x = np.asarray(xvals, dtype=float)[:, None]
+    D_arr = np.asarray(D, dtype=float)[None, :]
+    theta = np.deg2rad(x / 2.0)
+    theta0 = np.deg2rad(float(mu) / 2.0)
+    q = 2.0 * (np.sin(theta) - np.sin(theta0)) / max(float(wavelength), 1e-15)
+    z = np.pi * np.maximum(D_arr, 1e-12) * q
+    abs_z = np.abs(z)
+    amplitude = np.empty_like(z, dtype=float)
+    small = abs_z < 1e-5
+    amplitude[small] = 1.0 - (z[small] * z[small]) / 10.0
+    zz = z[~small]
+    amplitude[~small] = 3.0 * (np.sin(zz) - zz * np.cos(zz)) / (zz ** 3.0)
+    profile = amplitude * amplitude
+    return np.clip(profile, 0.0, None)
+
+
 def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max,
                            instrument_fwhm_deg=0.0):
     """
@@ -81,11 +106,16 @@ def calc_peak_params_numba(mu, wavelength, D_range, slope, M_ref_min, D_ref_max,
     # Scherrer 展宽 → 转换为度
     sigma_rad = 0.9 * wavelength / (D_range * np.cos(theta))
     gamma_deg = sigma_rad * 180.0 / np.pi
-    if instrument_fwhm_deg > 0.0:
-        gamma_deg = np.sqrt(gamma_deg ** 2.0 + instrument_fwhm_deg ** 2.0)
 
-    # m 参数：线性插值并钳制到 [0.5, 5.0]
-    m = np.clip(M_ref_min + (D_range - D_ref_max) * slope, 0.5, 5.0)
+    # m is clipped to [1.0, 5.0]. m=1 is the integrable Lorentzian limit.
+    m = np.clip(M_ref_min + (D_range - D_ref_max) * slope, 1.0, 5.0)
+
+    if instrument_fwhm_deg > 0.0:
+        # Approximate convolution of size and instrument FWHM.
+        # n=1 behaves like Lorentzian linear addition; n=2 behaves like
+        # Gaussian quadratic addition. Pearson m interpolates between them.
+        n_mix = np.clip(1.0 + (m - 1.0) / 4.0, 1.0, 2.0)
+        gamma_deg = (gamma_deg ** n_mix + float(instrument_fwhm_deg) ** n_mix) ** (1.0 / n_mix)
 
     # Pearson VII γ 与 FWHM 的换算
     gamma_vii = gamma_deg / (2.0 * np.sqrt(2.0 ** (1.0 / m) - 1.0))

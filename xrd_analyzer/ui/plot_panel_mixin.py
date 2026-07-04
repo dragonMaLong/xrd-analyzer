@@ -561,6 +561,49 @@ def _set_legend_sample_hover(plot, sample_index: int | None) -> None:
         _refresh_legend_layout(plot)
 
 
+def _mouse_event_is_accepted(event) -> bool:
+    try:
+        accepted = event.isAccepted()
+        return bool(accepted() if callable(accepted) else accepted)
+    except Exception:
+        return False
+
+
+def _line_coordinate_interaction_at(plot: pg.PlotWidget, scene_pos: QtCore.QPointF) -> bool:
+    if plot is None or scene_pos is None:
+        return False
+    try:
+        for editor in plot.findChildren(QtWidgets.QLineEdit, "xrdCoordinateInlineEditor"):
+            if not editor.isVisible():
+                continue
+            widget_pos = plot.mapFromScene(scene_pos)
+            if hasattr(widget_pos, "toPoint"):
+                widget_pos = widget_pos.toPoint()
+            if editor.geometry().adjusted(-3, -3, 3, 3).contains(widget_pos):
+                return True
+    except Exception:
+        pass
+    try:
+        scene = plot.scene()
+        for item in scene.items(scene_pos):
+            current = item
+            for _ in range(8):
+                if current is None:
+                    break
+                if getattr(current, "_xrd_coordinate_label_item", False):
+                    try:
+                        if not current.isVisible():
+                            break
+                    except Exception:
+                        pass
+                    return True
+                parent = getattr(current, "parentItem", None)
+                current = parent() if callable(parent) else None
+    except Exception:
+        pass
+    return False
+
+
 class ClickProjectionCursor:
     """BET-style click-to-show projected coordinates."""
 
@@ -594,6 +637,8 @@ class ClickProjectionCursor:
         self.view_box.sigRangeChanged.connect(lambda *_args: self.update())
 
     def _is_disabled(self) -> bool:
+        if getattr(self.plot, "_xrd_coordinate_editor_active", False):
+            return True
         guard = getattr(self.plot, "_click_projection_cursor_disabled", False)
         try:
             return bool(guard()) if callable(guard) else bool(guard)
@@ -612,6 +657,8 @@ class ClickProjectionCursor:
             self.clear()
             return
         if event.button() != Qt.LeftButton:
+            return
+        if _mouse_event_is_accepted(event) or _line_coordinate_interaction_at(self.plot, event.scenePos()):
             return
         if _legend_contains_scene_pos(self.plot, event.scenePos()):
             if hasattr(event, "accept"):
@@ -1584,7 +1631,8 @@ class PlotPanelMixin:
         )
 
         self.fit_plot = self._make_plot("拟合范围预览", "Intensity", "2θ (°)")
-        self.size_plot = self._make_plot("粒径分布 (计算后显示)", "Volume Density", "Particle size (nm)")
+        self.size_plot = self._make_plot("粒径分布 (计算后显示)", "Volume Density (体积分布)", "Particle size (nm)")
+        self.size_distribution_mode = "volume"
         self.fit_plot._click_projection_cursor_disabled = lambda: bool(
             getattr(self, "manual_baseline_enabled", False)
         )
@@ -1668,7 +1716,7 @@ class PlotPanelMixin:
         compare_layout.setContentsMargins(0, 0, 0, 0)
         compare_layout.setSpacing(6)
         self.compare_preview_plot = self._make_plot("完整数据预览", "Intensity", "2θ (°)")
-        self.compare_size_plot = self._make_plot("粒径分布", "Volume Density", "Particle size (nm)")
+        self.compare_size_plot = self._make_plot("粒径分布", "Volume Density (体积分布)", "Particle size (nm)")
         setattr(self.compare_size_plot, "_legend_default_position", "right")
         for plot in (self.compare_preview_plot, self.compare_size_plot):
             setattr(plot, "_sample_curve_selected_callback", self._select_sample_from_curve)
@@ -1696,6 +1744,39 @@ class PlotPanelMixin:
         _install_legend_toggle(plot)
         _enable_click_projection_cursor(plot)
         return plot
+
+    def _set_size_distribution_mode(self, mode: str) -> None:
+        mode = "number" if str(mode).lower() == "number" else "volume"
+        if getattr(self, "size_distribution_mode", "volume") == mode:
+            return
+        self.size_distribution_mode = mode
+        if getattr(self, "results_ready", False) and getattr(self, "all_peak_info", None):
+            active_indices = list(getattr(self, "result_active_peak_indices", self.active_peak_indices))
+            self._redraw_size_distribution_plot(active_indices)
+            self._safe_draw_idle()
+
+    def _size_distribution_axis_label(self) -> str:
+        if getattr(self, "size_distribution_mode", "volume") == "number":
+            return "Number Density (数量分布)"
+        return "Volume Density (体积分布)"
+
+    def _size_distribution_legend_label(self, peak_id: int | None = None) -> str:
+        suffix = "Number Size Distribution" if getattr(self, "size_distribution_mode", "volume") == "number" else "Particle Size Distribution"
+        return f"Peak{peak_id + 1} {suffix}" if peak_id is not None else f"Total {suffix}"
+
+    @staticmethod
+    def _distribution_weights(info: dict, D_range: np.ndarray, mode: str) -> np.ndarray:
+        values = np.asarray(info.get("volume_dist", info.get("f_segment", [])), dtype=float)
+        D = np.asarray(D_range, dtype=float)
+        if values.size != D.size:
+            return np.zeros_like(D, dtype=float)
+        values = np.clip(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+        if mode == "number":
+            safe_D = np.where(np.isfinite(D) & (D > 0.0), D, np.nan)
+            values = values / np.maximum(safe_D ** 3.0, 1e-30)
+            values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+            values = np.clip(values, 0.0, None)
+        return values
 
     def _sample_display_name(self, sample) -> str:
         try:
@@ -1845,7 +1926,7 @@ class PlotPanelMixin:
 
         self.compare_preview_plot.setLabel("left", "Intensity")
         self.compare_preview_plot.setLabel("bottom", "2θ (°)")
-        self.compare_size_plot.setLabel("left", "Volume Density")
+        self.compare_size_plot.setLabel("left", "Volume Density (体积分布)")
         self.compare_size_plot.setLabel("bottom", "Particle size (nm)")
         hovered = getattr(self, "_hovered_sample_row", -1)
         self.set_sample_curve_hover_plots(
@@ -2623,6 +2704,7 @@ class PlotPanelMixin:
             label.setCursor(Qt.IBeamCursor)
         except Exception:
             pass
+        label._xrd_coordinate_label_item = True
 
         def label_mouse_click(event, coord_label=label):
             try:
@@ -2658,6 +2740,8 @@ class PlotPanelMixin:
             label._xrd_editor = None
             label._xrd_editing = False
         plot = getattr(label, "_xrd_plot", None) or getattr(line, "_xrd_plot", None)
+        if plot is not None:
+            plot._xrd_coordinate_editor_active = False
         if plot is not None:
             try:
                 plot.removeItem(label)
@@ -2697,6 +2781,10 @@ class PlotPanelMixin:
             for editor in plot.findChildren(QtWidgets.QLineEdit, "xrdCoordinateInlineEditor"):
                 editor.hide()
                 editor.deleteLater()
+        except Exception:
+            pass
+        try:
+            plot._xrd_coordinate_editor_active = False
         except Exception:
             pass
 
@@ -2788,6 +2876,7 @@ class PlotPanelMixin:
         )
         label._xrd_editor = editor
         label._xrd_editor_original_text = str(current)
+        plot._xrd_coordinate_editor_active = True
         self._position_coordinate_editor(editor, label)
         editor.show()
         editor.raise_()
@@ -2807,6 +2896,7 @@ class PlotPanelMixin:
                 pass
             label._xrd_editor = None
             label._xrd_editing = False
+            plot._xrd_coordinate_editor_active = False
             label.show()
 
         def finish() -> None:
@@ -2828,6 +2918,7 @@ class PlotPanelMixin:
                 pass
             label._xrd_editor = None
             label._xrd_editing = False
+            plot._xrd_coordinate_editor_active = False
             self._apply_coordinate_label_value(label, value)
 
         editor._xrd_cancel = cancel
@@ -3521,7 +3612,7 @@ class PlotPanelMixin:
         if not self.results_ready:
             self._redraw_axes0_range_preview(angle_min, angle_max)
             self._clear_plot(self.size_plot, title="粒径分布 (计算后显示)")
-            self.size_plot.setLabel("left", "Volume Density")
+            self.size_plot.setLabel("left", self._size_distribution_axis_label())
             self.size_plot.setLabel("bottom", "Particle size (nm)")
         else:
             self._update_axes0_context_data(angle_min, angle_max, autoscale=False)
@@ -3644,13 +3735,16 @@ class PlotPanelMixin:
 
         eps = 1e-12
         D_range = np.asarray(self.D_range, dtype=float)
-        A_total_sum = 0.0
-        for info in self.all_peak_info:
-            A_total_sum += sum(float(det.get("area", 0.0)) for det in info.get("peak_details", []))
-        A_total_sum = max(A_total_sum, eps)
+        mode = getattr(self, "size_distribution_mode", "volume")
+        peak_weights = [
+            self._distribution_weights(info, D_range, mode)
+            for info in self.all_peak_info
+        ]
+        total_weight = float(np.sum(peak_weights)) if peak_weights else 0.0
+        total_weight = max(total_weight, eps)
 
-        global_f_sum = sum(np.asarray(info["f_segment"], dtype=float) for info in self.all_peak_info)
-        global_y_pdf = global_f_sum / A_total_sum
+        global_f_sum = np.sum(peak_weights, axis=0) if peak_weights else np.zeros_like(D_range)
+        global_y_pdf = global_f_sum / total_weight
 
         global_line = self._line(
             self.size_plot,
@@ -3659,7 +3753,7 @@ class PlotPanelMixin:
             "#111111",
             width=2.4,
             style=Qt.DashLine,
-            name="Total Distribution",
+            name=self._size_distribution_legend_label(),
         )
         global_fill = self._add_fill(self.size_plot, D_range, global_y_pdf, np.zeros_like(global_y_pdf), "#6b7280", alpha=0.18)
         self.actual_components["global"] = {"items": [global_line, *global_fill.values()]}
@@ -3670,9 +3764,9 @@ class PlotPanelMixin:
         for i, info in enumerate(self.all_peak_info):
             peak_id = active_indices[i] if i < len(active_indices) else i
             color = self._peak_color(peak_id)
-            f_total = np.asarray(info["f_segment"], dtype=float)
-            line_y_pdf = f_total / A_total_sum
-            label = f"Peak{peak_id + 1} Particle Size Distribution"
+            f_total = peak_weights[i] if i < len(peak_weights) else np.zeros_like(D_range)
+            line_y_pdf = f_total / total_weight
+            label = self._size_distribution_legend_label(peak_id)
             line = self._line(self.size_plot, D_range, line_y_pdf, color, width=2.0, name=label)
             fill = self._add_fill(self.size_plot, D_range, line_y_pdf, np.zeros_like(line_y_pdf), color, alpha=0.12)
             items = [line, *fill.values()]
@@ -3682,12 +3776,18 @@ class PlotPanelMixin:
                 if len(idx) == 0:
                     continue
                 idx = np.asarray(idx, dtype=int)
-                local_max_idx = int(np.nanargmax(line_y_pdf[idx]))
-                real_idx = int(idx[local_max_idx])
-                cx = float(D_range[real_idx])
-                cy = float(line_y_pdf[real_idx])
+                det_center = float(det.get("center", D_range[int(idx[0])]))
+                if mode == "number":
+                    local_max_idx = int(np.nanargmax(line_y_pdf[idx]))
+                    real_idx = int(idx[local_max_idx])
+                    cx = float(D_range[real_idx])
+                    label_center = cx
+                else:
+                    cx = det_center
+                    label_center = det_center
+                cy = float(np.interp(cx, D_range, line_y_pdf))
                 y_max = max(y_max, cy)
-                txt = pg.TextItem(text=f"{float(det['center']):.2f}nm", color=color, anchor=(0.5, 1.0))
+                txt = pg.TextItem(text=f"{label_center:.2f}nm", color=color, anchor=(0.5, 1.0))
                 txt.setZValue(30)
                 self.size_plot.addItem(txt)
                 txt.setPos(cx, cy * 1.05)
@@ -3696,7 +3796,7 @@ class PlotPanelMixin:
             self.actual_components[peak_id] = {"items": items}
             self.dist_texts[peak_id] = texts
 
-        self.size_plot.setLabel("left", "Volume Density")
+        self.size_plot.setLabel("left", self._size_distribution_axis_label())
         self.size_plot.setLabel("bottom", "Particle size (nm)")
         self._set_plot_xrange(self.size_plot, float(np.nanmin(D_range)), float(np.nanmax(D_range)))
         self.size_plot.setYRange(0.0, y_max * 1.2 if y_max > 0 else 1.0, padding=0)
