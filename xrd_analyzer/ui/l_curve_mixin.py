@@ -34,6 +34,7 @@ class LCurveMixin:
             "d_max": float(getattr(self, "particle_size_max", 100.0)),
             "d_step": float(getattr(self, "particle_size_step", 0.1)),
             "instrument_fwhm": float(getattr(self, "instrument_fwhm", 0.0)),
+            "peak_kernel": str(getattr(self, "peak_kernel", "pearson7") or "pearson7"),
             "baseline_state": self._current_manual_baseline_state(),
         }
 
@@ -58,12 +59,13 @@ class LCurveMixin:
         threading.Thread(target=self.compute_l_curve, args=(params,), daemon=True).start()
 
     def compute_l_curve(self, params):
-        """执行 α 扫描，寻找 L-Curve 拐点（最大曲率法）。"""
+        """执行 α 扫描，寻找 L-Curve 拐点（最大弦距法，triangle method）。"""
         try:
             source = params["source"]
             lam1, lam2 = WAVELENGTHS.get(source, WAVELENGTHS["Cu"])
             mu_centers = list(params["mu_centers"])
             inst_fwhm = float(params["instrument_fwhm"])
+            peak_kernel = str(params.get("peak_kernel", "pearson7") or "pearson7").lower()
             angle_min = params["angle_min"]
             angle_max = params["angle_max"]
 
@@ -103,9 +105,10 @@ class LCurveMixin:
                 lam1,
                 lam2,
                 instrument_fwhm_deg=inst_fwhm,
+                kernel=peak_kernel,
             )
 
-            alpha_values = np.logspace(-2, 4, 50)
+            alpha_values = np.logspace(-4, 4, 50)
             residual_norms = []
             solution_norms = []
             n_peaks = len(mu_centers)
@@ -173,19 +176,20 @@ class LCurveMixin:
         plot = pg.PlotWidget()
         plot.setBackground("w")
         plot.setTitle("L-Curve Parameter Selection", color="#111827", size="10pt")
-        plot.setLabel("bottom", "Residual Norm ||Af - y||  (Fitting Error)")
-        plot.setLabel("left", "Solution Norm ||Lf||  (Roughness)")
+        plot.setLabel("bottom", "log10 Residual Norm ||Af - y||  (Fitting Error)")
+        plot.setLabel("left", "log10 Solution Norm ||Lf||  (Roughness)")
         plot.showGrid(x=True, y=True, alpha=0.32)
-        plot.getPlotItem().setLogMode(x=True, y=True)
         legend = plot.addLegend(offset=(10, 10))
         legend.setBrush(pg.mkBrush(255, 255, 255, 220))
         legend.setPen(pg.mkPen("#d1d5db"))
 
-        x_arr = np.asarray(x_data, dtype=float)
-        y_arr = np.asarray(y_data, dtype=float)
+        x_arr = np.maximum(np.asarray(x_data, dtype=float), 1e-300)
+        y_arr = np.maximum(np.asarray(y_data, dtype=float), 1e-300)
+        x_plot = np.log10(x_arr)
+        y_plot = np.log10(y_arr)
         curve = pg.PlotDataItem(
-            x_arr,
-            y_arr,
+            x_plot,
+            y_plot,
             pen=pg.mkPen("#2563eb", width=2),
             symbol="o",
             symbolSize=6,
@@ -195,8 +199,8 @@ class LCurveMixin:
         )
         plot.addItem(curve)
 
-        best_x = x_data[best_idx]
-        best_y = y_data[best_idx]
+        best_x = x_plot[best_idx]
+        best_y = y_plot[best_idx]
         best_alpha = alphas[best_idx]
         best_item = pg.ScatterPlotItem(
             [best_x],
@@ -212,7 +216,7 @@ class LCurveMixin:
             font = label.textItem.font()
             font.setPointSize(7)
             label.textItem.setFont(font)
-            label.setPos(float(x_data[i]), float(y_data[i]))
+            label.setPos(float(x_plot[i]), float(y_plot[i]))
             plot.addItem(label)
 
         layout.addWidget(plot, 1)

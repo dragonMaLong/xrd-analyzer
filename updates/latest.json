@@ -1,16 +1,16 @@
 {
-  "version": "2.0.2",
-  "name": "XRD-Analyzer v2.0.2",
+  "version": "2.0.3",
+  "name": "XRD-Analyzer v2.0.3",
   "asset_name": "XRD-Analyzer.exe",
-  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.2",
-  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe",
-  "gitee_release_url": "https://gitee.com/dragonMalong/xrd-analyzer/releases/tag/v2.0.2",
+  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.3",
+  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe",
+  "gitee_release_url": "https://gitee.com/dragonMalong/xrd-analyzer/releases/tag/v2.0.3",
   "gitee_download_parts": [
-    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe.part1",
-    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe.part2"
+    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe.part1",
+    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe.part2"
   ],
-  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.2/XRD-Analyzer.exe",
-  "sha256": "a24350c706ec496567a7c1ddc6d692f015e6b17af0d5eebabce22042e05ec1b6",
-  "published_at": "2026-07-02",
-  "release_notes": "V2.0.2: adds the statistics result table, improves imported-data default fit ranges, supports Bruker RAW1.01 supplemental points, and includes the experimental DL super-resolution method."
+  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe",
+  "sha256": "591d00877d6ef3d4827aac8138424430c5d5b41ebfdd0edb0c8314c1371d8c0e",
+  "published_at": "2026-07-04",
+  "release_notes": "V2.0.3: adds area-normalized Pearson VII inversion, volume/number size distribution switching, sphere-kernel option, improved L-Curve and advanced settings, and fixes angle-label editing versus coordinate-click interaction."
 }
