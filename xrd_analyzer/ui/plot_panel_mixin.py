@@ -1616,6 +1616,7 @@ class PlotPanelMixin:
         self.preview_plot.setTitle("完整数据预览", color="#111827", size="10pt")
         self.preview_ax = self.preview_plot
         self.preview_canvas = self.preview_plot
+        self.preview_plot.getPlotItem().getViewBox().setMouseEnabled(x=False, y=False)
         self.preview_plot.scene().sigMouseClicked.connect(self._on_preview_plot_mouse_clicked)
         preview_layout.addWidget(self.preview_plot, 1)
 
@@ -2038,6 +2039,101 @@ class PlotPanelMixin:
     def _add_peak_legend_toggles(self, plot: pg.PlotWidget, peak_indices) -> None:
         for peak_idx in list(peak_indices or []):
             self._add_peak_legend_toggle(plot, int(peak_idx))
+
+    def _size_component_visible(self, component_id: int | str) -> bool:
+        return bool(getattr(self, "_size_visibility", {}).get(component_id, True))
+
+    def _update_size_legend_style(self, component_id: int | str) -> None:
+        handle = getattr(self, "legend_handles", {}).get(component_id)
+        if not handle:
+            return
+        visible = self._size_component_visible(component_id)
+        label_text = str(handle.get("text", ""))
+        sample = handle.get("sample")
+        label = handle.get("label")
+        try:
+            label.setText(label_text, color="#111827" if visible else "#9ca3af", size="9pt")
+        except Exception:
+            pass
+        try:
+            sample.setOpacity(1.0 if visible else 0.25)
+            label.setOpacity(1.0 if visible else 0.55)
+        except Exception:
+            pass
+
+    def _bind_size_legend_toggle(self, component_id: int | str, label_text: str) -> None:
+        legend = self._ensure_plot_legend(self.size_plot)
+        try:
+            sample, label = legend.items[-1]
+        except Exception:
+            return
+        self.legend_handles[component_id] = {
+            "sample": sample,
+            "label": label,
+            "text": str(label_text),
+        }
+        for obj in (sample, label):
+            try:
+                obj.setCursor(Qt.PointingHandCursor)
+                obj.setAcceptedMouseButtons(Qt.LeftButton)
+            except Exception:
+                pass
+
+            def on_click(event, key=component_id):
+                try:
+                    if event.button() == Qt.LeftButton:
+                        event.accept()
+                    else:
+                        return
+                except Exception:
+                    pass
+                self._set_size_component_visibility(key, not self._size_component_visible(key))
+
+            try:
+                obj.mouseClickEvent = on_click
+            except Exception:
+                pass
+        self._update_size_legend_style(component_id)
+
+    def _apply_size_component_visibility(self, component_id: int | str) -> None:
+        component = getattr(self, "actual_components", {}).get(component_id, {})
+        self._set_items_visible(component.get("items", []), self._size_component_visible(component_id))
+        self._update_size_legend_style(component_id)
+
+    def _set_size_component_visibility(self, component_id: int | str, visible: bool) -> None:
+        if not hasattr(self, "_size_visibility"):
+            self._size_visibility = {}
+        self._size_visibility[component_id] = bool(visible)
+        self._apply_size_component_visibility(component_id)
+        if component_id != "global":
+            self._update_visible_size_total()
+        self._safe_draw_idle()
+
+    def _update_visible_size_total(self) -> None:
+        components = getattr(self, "actual_components", {})
+        global_component = components.get("global", {})
+        x_values = np.asarray(global_component.get("x", []), dtype=float)
+        if x_values.size == 0:
+            return
+        visible_total = np.zeros_like(x_values, dtype=float)
+        for component_id, component in components.items():
+            if component_id == "global" or not self._size_component_visible(component_id):
+                continue
+            values = np.asarray(component.get("y", []), dtype=float)
+            if values.size == visible_total.size:
+                visible_total += values
+
+        line = global_component.get("line")
+        fill = global_component.get("fill", {})
+        if line is not None:
+            line.setData(x_values, visible_total)
+        top_curve = fill.get("top")
+        bottom_curve = fill.get("bottom")
+        if top_curve is not None:
+            top_curve.setData(x_values, visible_total)
+        if bottom_curve is not None:
+            bottom_curve.setData(x_values, np.zeros_like(visible_total))
+        global_component["y"] = visible_total
 
     def _set_fit_marker_text_visible(self, visible: bool) -> None:
         self.marker_text_visible = bool(visible)
@@ -3539,6 +3635,7 @@ class PlotPanelMixin:
             return
 
         angle_min, angle_max = self._normalize_angle_range()
+        data_angle_min, data_angle_max = self._data_angle_bounds()
         self._refresh_peak_slider_bounds()
 
         self._clear_plot(self.preview_plot, title="完整数据预览")
@@ -3559,6 +3656,7 @@ class PlotPanelMixin:
         self.preview_range_region = pg.LinearRegionItem(
             values=sorted((float(angle_min), float(angle_max))),
             orientation=pg.LinearRegionItem.Vertical,
+            bounds=(float(data_angle_min), float(data_angle_max)),
             brush=pg.mkBrush(self._rgba("#2563eb", 0.10)),
             pen=self._curve_pen("#2563eb", width=2.0, style=Qt.DashLine, alpha=0.95),
             hoverBrush=pg.mkBrush(self._rgba("#2563eb", 0.14)),
@@ -3683,7 +3781,7 @@ class PlotPanelMixin:
                 label = DraggableMarkerTextItem(
                     self,
                     self.fit_plot,
-                    f"{float(detail['center']):.2f}nm({float(detail['percentage']):.0f}%)",
+                    f"{float(detail['center']):.2f}nm({float(detail['percentage']):.2f}%)",
                     color,
                     peak_anchor,
                     marker_key=f"component:{peak_id}:{j}",
@@ -3756,8 +3854,15 @@ class PlotPanelMixin:
             name=self._size_distribution_legend_label(),
         )
         global_fill = self._add_fill(self.size_plot, D_range, global_y_pdf, np.zeros_like(global_y_pdf), "#6b7280", alpha=0.18)
-        self.actual_components["global"] = {"items": [global_line, *global_fill.values()]}
+        self.actual_components["global"] = {
+            "items": [global_line, *global_fill.values()],
+            "line": global_line,
+            "fill": global_fill,
+            "x": D_range,
+            "y": global_y_pdf,
+        }
         self.dist_texts["global"] = []
+        self._bind_size_legend_toggle("global", self._size_distribution_legend_label())
 
         y_max = float(np.nanmax(global_y_pdf)) if len(global_y_pdf) else 1.0
 
@@ -3793,8 +3898,19 @@ class PlotPanelMixin:
                 txt.setPos(cx, cy * 1.05)
                 texts.append(txt)
                 items.append(txt)
-            self.actual_components[peak_id] = {"items": items}
+            self.actual_components[peak_id] = {
+                "items": items,
+                "line": line,
+                "fill": fill,
+                "x": D_range,
+                "y": line_y_pdf,
+            }
             self.dist_texts[peak_id] = texts
+            self._bind_size_legend_toggle(peak_id, label)
+
+        for component_id in self.actual_components:
+            self._apply_size_component_visibility(component_id)
+        self._update_visible_size_total()
 
         self.size_plot.setLabel("left", self._size_distribution_axis_label())
         self.size_plot.setLabel("bottom", "Particle size (nm)")

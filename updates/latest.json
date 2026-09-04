@@ -1,16 +1,16 @@
 {
-  "version": "2.0.3",
-  "name": "XRD-Analyzer v2.0.3",
+  "version": "2.0.4",
+  "name": "XRD-Analyzer v2.0.4",
   "asset_name": "XRD-Analyzer.exe",
-  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.3",
-  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe",
-  "gitee_release_url": "https://gitee.com/dragonMalong/xrd-analyzer/releases/tag/v2.0.3",
+  "github_release_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/tag/v2.0.4",
+  "github_download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.4/XRD-Analyzer.exe",
+  "gitee_release_url": "https://gitee.com/dragonMalong/xrd-analyzer/releases/tag/v2.0.4",
   "gitee_download_parts": [
-    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe.part1",
-    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe.part2"
+    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.4/XRD-Analyzer.exe.part1",
+    "https://gitee.com/dragonMalong/xrd-analyzer/releases/download/v2.0.4/XRD-Analyzer.exe.part2"
   ],
-  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.3/XRD-Analyzer.exe",
-  "sha256": "591d00877d6ef3d4827aac8138424430c5d5b41ebfdd0edb0c8314c1371d8c0e",
-  "published_at": "2026-07-04",
-  "release_notes": "V2.0.3: adds area-normalized Pearson VII inversion, volume/number size distribution switching, sphere-kernel option, improved L-Curve and advanced settings, and fixes angle-label editing versus coordinate-click interaction."
+  "download_url": "https://github.com/dragonMaLong/xrd-analyzer/releases/download/v2.0.4/XRD-Analyzer.exe",
+  "sha256": "0489e8e5f011e1e1e9ddc8de9799dbd39946d3c18c6c7aa36430d0e9253f0239",
+  "published_at": "2026-09-04",
+  "release_notes": "V2.0.4: improves plot interaction by locking full-data preview zoom/pan, constraining range selectors to measured bounds, showing component percentages to two decimals, and synchronizing peak lines, fills, labels, and the visible-only Total size distribution."
 }
