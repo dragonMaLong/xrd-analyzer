@@ -14,7 +14,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .qt_controls import QtLabeledSpin, QtSpinSlider
 
-SUPPORTED_DROP_SUFFIXES = {".txt", ".raw"}
+SUPPORTED_DROP_SUFFIXES = {".txt", ".raw", ".xrdproj"}
+SAMPLE_STATUS_PROGRESS_ROLE = int(QtCore.Qt.UserRole) + 401
 
 
 def make_update_available_icon(size: int = 28) -> QtGui.QIcon:
@@ -154,6 +155,36 @@ class _CenteredStatusIconDelegate(QtWidgets.QStyledItemDelegate):
         opt.text = ""
         style = opt.widget.style() if opt.widget is not None else QtWidgets.QApplication.style()
         style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        progress = index.data(SAMPLE_STATUS_PROGRESS_ROLE)
+        if progress is not None:
+            try:
+                progress = max(0.0, min(100.0, float(progress)))
+            except (TypeError, ValueError):
+                progress = 0.0
+            diameter = 15.0
+            circle = QtCore.QRectF(
+                opt.rect.center().x() - diameter / 2.0,
+                opt.rect.center().y() - diameter / 2.0,
+                diameter,
+                diameter,
+            )
+            painter.save()
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            base_pen = QtGui.QPen(QtGui.QColor("#bfdbfe"), 3.2)
+            base_pen.setCapStyle(QtCore.Qt.RoundCap)
+            painter.setPen(base_pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawEllipse(circle)
+            if progress > 0.0:
+                progress_pen = QtGui.QPen(QtGui.QColor("#2563eb"), 3.2)
+                progress_pen.setCapStyle(QtCore.Qt.RoundCap)
+                painter.setPen(progress_pen)
+                if progress >= 99.95:
+                    painter.drawEllipse(circle)
+                else:
+                    painter.drawArc(circle, 90 * 16, -int(round(progress * 3.6 * 16)))
+            painter.restore()
+            return
         if icon.isNull():
             return
         pixmap = icon.pixmap(QtCore.QSize(18, 18))
@@ -367,6 +398,7 @@ class ControlPanelMixin:
         self.btn_import = QtWidgets.QPushButton("导入文件")
         self.btn_import.clicked.connect(self.load_file)
         self.btn_import.setFixedSize(96, 32)
+        self.btn_import.setToolTip("导入 TXT、RAW 或 XRD 工程文件")
 
         self.update_available_button = QtWidgets.QToolButton()
         self.update_available_button.setIcon(make_update_available_icon(28))
@@ -398,23 +430,41 @@ class ControlPanelMixin:
         self.sample_table.verticalHeader().setDefaultSectionSize(28)
         self.sample_table.setAlternatingRowColors(True)
         self.sample_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.sample_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.sample_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.sample_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.sample_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.sample_table.setShowGrid(False)
         self.sample_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.sample_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.sample_table.setMinimumHeight(120)
         self.sample_table.setIconSize(QtCore.QSize(18, 18))
-        self.sample_table.setColumnWidth(self.sample_compare_col, 30)
-        self.sample_table.setColumnWidth(self.sample_file_col, 170)
-        self.sample_table.setColumnWidth(self.sample_status_col, 48)
         self.sample_table.setItemDelegate(_NoFocusDelegate(self.sample_table))
         sample_header = self.sample_table.horizontalHeader()
         sample_header.setStretchLastSection(False)
         sample_header.setSectionsMovable(False)
         sample_header.setHighlightSections(False)
         sample_header.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        sample_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        for column in (self.sample_file_col, self.sample_status_col):
+            header_item = self.sample_table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setTextAlignment(QtCore.Qt.AlignCenter)
+        # Keep the compact edge columns fixed and let the filename column
+        # absorb every width change.  The status column therefore remains
+        # flush with the table's right border instead of leaving blank space.
+        sample_header.setSectionResizeMode(
+            self.sample_compare_col,
+            QtWidgets.QHeaderView.Fixed,
+        )
+        sample_header.setSectionResizeMode(
+            self.sample_file_col,
+            QtWidgets.QHeaderView.Stretch,
+        )
+        sample_header.setSectionResizeMode(
+            self.sample_status_col,
+            QtWidgets.QHeaderView.Fixed,
+        )
+        self.sample_table.setColumnWidth(self.sample_compare_col, 30)
+        self.sample_table.setColumnWidth(self.sample_status_col, 64)
         sample_header.sectionResized.connect(self._position_compare_select_all_check)
         sample_header.geometriesChanged.connect(self._position_compare_select_all_check)
         self.sample_table.horizontalScrollBar().valueChanged.connect(self._position_compare_select_all_check)
@@ -430,6 +480,7 @@ class ControlPanelMixin:
         self.sample_table.currentCellChanged.connect(self._on_sample_table_current_changed)
         self.sample_table.itemChanged.connect(self._on_sample_table_item_changed)
         self.sample_table.rowHovered.connect(self._on_sample_table_row_hovered)
+        self.sample_table.customContextMenuRequested.connect(self._show_sample_context_menu)
         self.sample_table.setStyleSheet(
             """
             QTableWidget {
@@ -506,6 +557,9 @@ class ControlPanelMixin:
         self.sample_result_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
         self.sample_result_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        self.sample_result_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.sample_result_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self._install_table_copy_menu(self.sample_result_table)
         self.sample_stats_table = self._make_detail_table(["粒径区间", "百分比"])
         self.sample_stats_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.sample_stats_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
@@ -591,7 +645,11 @@ class ControlPanelMixin:
         rows = sorted({idx.row() for idx in indexes})
         cols = sorted({idx.column() for idx in indexes})
         selected = {(idx.row(), idx.column()) for idx in indexes}
-        lines = []
+        headers = []
+        for col in cols:
+            header_item = table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item is not None else "")
+        lines = ["\t".join(headers)]
         for row in rows:
             values = []
             for col in cols:
@@ -679,8 +737,10 @@ class ControlPanelMixin:
         self.peaks_detail_button.setCheckable(True)
         self.peaks_detail_button.setFixedSize(48, 22)
         self.peaks_detail_button.setToolTip("展开或收起默认峰列表")
-        add_peak_button = QtWidgets.QPushButton("添加", peak_group)
-        add_peak_button.setFixedSize(56, 22)
+        self.add_peak_button = QtWidgets.QPushButton("添加", peak_group)
+        self.add_peak_button.setCheckable(True)
+        self.add_peak_button.setFixedSize(56, 22)
+        self.add_peak_button.setToolTip("选择后，在完整数据预览或拟合图中点击以添加峰；再次点击或按 Esc 退出")
         peak_button_style = (
             """
             QPushButton {
@@ -699,15 +759,24 @@ class ControlPanelMixin:
             QPushButton:pressed {
                 background: #e5e9ed;
             }
+            QPushButton:checked {
+                background: #2563eb;
+                color: #ffffff;
+                border-color: #1d4ed8;
+            }
+            QPushButton:checked:hover {
+                background: #1d4ed8;
+                border-color: #1e40af;
+            }
             """
         )
         self.peaks_detail_button.setStyleSheet(peak_button_style)
-        add_peak_button.setStyleSheet(peak_button_style)
+        self.add_peak_button.setStyleSheet(peak_button_style)
         peak_actions.addWidget(self.peaks_detail_button)
-        peak_actions.addWidget(add_peak_button)
+        peak_actions.addWidget(self.add_peak_button)
         peak_layout.addLayout(peak_actions)
         self.peaks_detail_button.toggled.connect(self._set_peak_details_visible)
-        add_peak_button.clicked.connect(self.add_peak_control)
+        self.add_peak_button.toggled.connect(self._set_peak_placement_mode)
         row_index += 1
 
         self.peaks_frame = QtWidgets.QWidget(panel)
@@ -746,6 +815,7 @@ class ControlPanelMixin:
         source_row.addWidget(self.source_menu, 1)
         layout.addWidget(source_frame)
         self.source_var = _ComboValue(self.source_menu)
+        self.source_menu.currentTextChanged.connect(lambda _text: self._save_current_parameter_state())
 
         action_grid = QtWidgets.QGridLayout()
         action_grid.setContentsMargins(0, 2, 0, 0)
@@ -792,9 +862,36 @@ class ControlPanelMixin:
         self.btn_advanced = QtWidgets.QPushButton("高级")
         self.btn_advanced.clicked.connect(self._show_advanced_dialog)
         self.btn_lcurve = self.btn_advanced
-        self.btn_manual_baseline = QtWidgets.QPushButton("手动基线")
+        self.btn_manual_baseline = QtWidgets.QPushButton("基线")
         self.btn_manual_baseline.setCheckable(True)
-        self.btn_manual_baseline.setToolTip("在拟合图中显示并编辑计算基线")
+        self.btn_manual_baseline.setChecked(True)
+        self.btn_manual_baseline.setToolTip("左键添加锚点，右键删除锚点")
+        self.btn_manual_baseline.setStyleSheet(
+            """
+            QPushButton {
+                background: #f8fafc;
+                color: #475569;
+                border: 1px solid #cbd5e1;
+                border-radius: 3px;
+                padding: 2px 6px;
+                min-height: 22px;
+            }
+            QPushButton:hover {
+                background: #f1f5f9;
+                border-color: #94a3b8;
+            }
+            QPushButton:checked {
+                background: #2563eb;
+                color: #ffffff;
+                border-color: #1d4ed8;
+                font-weight: 700;
+            }
+            QPushButton:checked:hover {
+                background: #1d4ed8;
+                border-color: #1e40af;
+            }
+            """
+        )
         self.btn_manual_baseline.toggled.connect(self._on_manual_baseline_toggled)
         self.btn_save = QtWidgets.QPushButton("保存")
         self.btn_save.clicked.connect(self.save_results)
@@ -957,6 +1054,8 @@ class ControlPanelMixin:
                 self._set_size_distribution_mode(distribution_mode)
             else:
                 self.size_distribution_mode = distribution_mode
+            if hasattr(self, "_save_current_parameter_state"):
+                self._save_current_parameter_state()
             return True
 
         def accept_dialog() -> None:
@@ -1064,17 +1163,21 @@ class ControlPanelMixin:
         if pane is not None and hasattr(pane, "_sync_content_height"):
             pane._sync_content_height()
 
-    def add_peak_control(self):
+    def add_peak_control(self, value: float | None = None):
         self.max_peaks = len(self.peak_mu_sliders) + 1
-        region = getattr(self, "preview_range_region", None)
-        if region is not None:
-            try:
-                angle_min, angle_max = sorted(float(value) for value in region.getRegion())
-            except Exception:
+        if value is None:
+            region = getattr(self, "preview_range_region", None)
+            if region is not None:
+                try:
+                    angle_min, angle_max = sorted(float(item) for item in region.getRegion())
+                except Exception:
+                    angle_min, angle_max = self._normalize_angle_range()
+            else:
                 angle_min, angle_max = self._normalize_angle_range()
+            center = (float(angle_min) + float(angle_max)) / 2.0
         else:
-            angle_min, angle_max = self._normalize_angle_range()
-        center = (float(angle_min) + float(angle_max)) / 2.0
+            low, high = self._peak_value_bounds()
+            center = max(float(low), min(float(high), float(value)))
         new_index = self.max_peaks - 1
         self._create_peak_control(
             new_index,
@@ -1216,11 +1319,15 @@ class ControlPanelMixin:
             i for i, chk in enumerate(self.peak_check_vars) if chk.isChecked()
         ]
         self._refresh_peak_slider_bounds()
+        if getattr(self, "_restoring_sample_state", False):
+            return
         if not getattr(self, "_building_peak_controls", False):
             self._save_current_peak_states()
         self.update_preview()
 
     def _on_peak_value_changed(self):
+        if getattr(self, "_restoring_sample_state", False):
+            return
         if not getattr(self, "_building_peak_controls", False):
             self._save_current_peak_states()
         self.update_preview()
@@ -1255,7 +1362,19 @@ class ControlPanelMixin:
         index = getattr(self, "active_sample_index", -1)
         samples = getattr(self, "samples", [])
         if 0 <= index < len(samples):
-            samples[index].peak_states = self._current_peak_states()
+            states = self._current_peak_states()
+            if samples[index].peak_states != states:
+                calculation_changed = True
+                if hasattr(self, "_calculation_peak_states"):
+                    calculation_changed = (
+                        self._calculation_peak_states(samples[index].peak_states)
+                        != self._calculation_peak_states(states)
+                    )
+                samples[index].peak_states = states
+                if calculation_changed:
+                    samples[index].result_is_current = False
+                if hasattr(self, "_mark_project_dirty"):
+                    self._mark_project_dirty()
 
     def _current_analysis_state(self) -> dict[str, float]:
         if not hasattr(self, "slider_min") or not hasattr(self, "slider_max"):
@@ -1269,7 +1388,12 @@ class ControlPanelMixin:
         index = getattr(self, "active_sample_index", -1)
         samples = getattr(self, "samples", [])
         if 0 <= index < len(samples):
-            samples[index].analysis_state = self._current_analysis_state()
+            state = self._current_analysis_state()
+            if samples[index].analysis_state != state:
+                samples[index].analysis_state = state
+                samples[index].result_is_current = False
+                if hasattr(self, "_mark_project_dirty"):
+                    self._mark_project_dirty()
 
     def _apply_analysis_range_to_all_samples(self) -> None:
         samples = getattr(self, "samples", [])
@@ -1277,8 +1401,14 @@ class ControlPanelMixin:
             return
         angle_min, angle_max = self._normalize_angle_range()
         state = {"angle_min": float(angle_min), "angle_max": float(angle_max)}
+        changed = False
         for sample in samples:
-            sample.analysis_state = dict(state)
+            if sample.analysis_state != state:
+                sample.analysis_state = dict(state)
+                sample.result_is_current = False
+                changed = True
+        if changed and hasattr(self, "_mark_project_dirty"):
+            self._mark_project_dirty()
         self._save_current_analysis_state()
         self.statusBar().showMessage(
             f"已将分析区间 {angle_min:.2f} - {angle_max:.2f} 应用到全部样品",
@@ -1325,37 +1455,76 @@ class ControlPanelMixin:
         self.slider_max.set(angle_max, emit=False)
         self._normalize_angle_range()
 
-    def _apply_peak_states(self, states: list[dict[str, float | bool | str]]) -> None:
+    def _apply_peak_states(
+        self,
+        states: list[dict[str, float | bool | str]],
+        *,
+        refresh_preview: bool = True,
+    ) -> None:
         states = self._default_peak_states() if states is None else list(states)
         self._building_peak_controls = True
         try:
-            for i, state in enumerate(states):
-                self._set_peak_color_value(i, str(state.get("color", self._default_peak_color(i))))
-            while self.peaks_layout.count():
-                item = self.peaks_layout.takeAt(0)
-                widget = item.widget()
-                if widget is not None:
-                    widget.setParent(None)
-                    widget.deleteLater()
-            self.peak_rows = []
-            self.peak_check_vars = []
-            self.peak_mu_sliders = []
-            self.peak_color_buttons = []
-            self.peak_visible_buttons = []
-            self.peak_visible_states = []
-            self.max_peaks = len(states)
-            for i, state in enumerate(states):
-                self._create_peak_control(
-                    i,
-                    checked=bool(state.get("checked", i == 0)),
-                    value=float(state.get("value", 60 + i)),
-                    color=str(state.get("color", self._default_peak_color(i))),
-                    visible=bool(state.get("visible", True)),
+            can_reuse_controls = bool(states) and all(
+                len(getattr(self, name, [])) == len(states)
+                for name in (
+                    "peak_rows",
+                    "peak_check_vars",
+                    "peak_mu_sliders",
+                    "peak_color_buttons",
+                    "peak_visible_states",
                 )
+            )
+            if can_reuse_controls:
+                for i, state in enumerate(states):
+                    color = self._set_peak_color_value(
+                        i,
+                        str(state.get("color", self._default_peak_color(i))),
+                    )
+                    checkbox = self.peak_check_vars[i]
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(bool(state.get("checked", i == 0)))
+                    checkbox.blockSignals(False)
+                    self.peak_mu_sliders[i].set(
+                        float(state.get("value", 60 + i)),
+                        emit=False,
+                    )
+                    self._set_peak_color_button_style(self.peak_color_buttons[i], color)
+                    self.peak_visible_states[i] = bool(state.get("visible", True))
+                self.max_peaks = len(states)
+            else:
+                for i, state in enumerate(states):
+                    self._set_peak_color_value(i, str(state.get("color", self._default_peak_color(i))))
+                while self.peaks_layout.count():
+                    item = self.peaks_layout.takeAt(0)
+                    widget = item.widget()
+                    if widget is not None:
+                        widget.setParent(None)
+                        widget.deleteLater()
+                self.peak_rows = []
+                self.peak_check_vars = []
+                self.peak_mu_sliders = []
+                self.peak_color_buttons = []
+                self.peak_visible_buttons = []
+                self.peak_visible_states = []
+                self.max_peaks = len(states)
+                for i, state in enumerate(states):
+                    self._create_peak_control(
+                        i,
+                        checked=bool(state.get("checked", i == 0)),
+                        value=float(state.get("value", 60 + i)),
+                        color=str(state.get("color", self._default_peak_color(i))),
+                        visible=bool(state.get("visible", True)),
+                    )
         finally:
             self._building_peak_controls = False
         self._update_peak_scroll_extent()
-        self.update_ui_for_peaks()
+        if refresh_preview:
+            self.update_ui_for_peaks()
+        else:
+            self.active_peak_indices = [
+                i for i, checkbox in enumerate(self.peak_check_vars) if checkbox.isChecked()
+            ]
+            self._refresh_peak_slider_bounds()
 
     def _refresh_peak_slider_bounds(self):
         low, high = self._peak_value_bounds()
@@ -1363,6 +1532,8 @@ class ControlPanelMixin:
             s.config(from_=low, to=high)
 
     def _on_angle_slider_changed(self, changed: str, _value=None):
+        if getattr(self, "_restoring_sample_state", False):
+            return
         self._normalize_angle_range(changed)
         self._refresh_peak_slider_bounds()
         self._save_current_analysis_state()
@@ -1454,6 +1625,17 @@ class ControlPanelMixin:
         peak_infos = list(getattr(self, "all_peak_info", []) or [])
         if D_range.size < 2 or not peak_infos:
             return {}
+        runtime_cache = None
+        if hasattr(self, "_current_runtime_plot_cache"):
+            runtime_cache = self._current_runtime_plot_cache()
+        cache_token = (
+            id(getattr(self, "D_range", None)),
+            id(getattr(self, "all_peak_info", None)),
+        )
+        if isinstance(runtime_cache, dict):
+            cached = runtime_cache.get("particle_size_interval_percentages")
+            if isinstance(cached, dict) and cached.get("token") == cache_token:
+                return dict(cached.get("values") or {})
         global_y = np.zeros_like(D_range, dtype=float)
         for info in peak_infos:
             f_segment = np.asarray(info.get("f_segment", []), dtype=float)
@@ -1477,6 +1659,11 @@ class ControlPanelMixin:
             area = self._integrate_distribution_interval(D_range, global_y, left, right)
             pct = max(0.0, area / denominator * 100.0)
             percentages[label] = f"{pct:.2f}%"
+        if isinstance(runtime_cache, dict):
+            runtime_cache["particle_size_interval_percentages"] = {
+                "token": cache_token,
+                "values": dict(percentages),
+            }
         return percentages
 
     @staticmethod
@@ -1508,6 +1695,14 @@ class ControlPanelMixin:
             return []
         all_peak_info = list(getattr(self, "all_peak_info", []) or [])
         active_indices = list(getattr(self, "result_active_peak_indices", []) or [])
+        curve_data = None
+        try:
+            if hasattr(self, "_fit_curve_data_cache"):
+                curve_data = self._fit_curve_data_cache(active_indices)
+        except Exception:
+            curve_data = None
+        curve_specs = list(curve_data.get("peak_specs", [])) if isinstance(curve_data, dict) else []
+        curve_x = np.asarray(curve_data.get("x", []), dtype=float) if isinstance(curve_data, dict) else np.asarray([])
         rows: list[tuple[str, str, str, str, str, str]] = []
         for i, info in enumerate(all_peak_info):
             peak_idx = active_indices[i] if i < len(active_indices) else i
@@ -1515,13 +1710,32 @@ class ControlPanelMixin:
             if peak_idx < len(getattr(self, "peak_mu_sliders", [])):
                 peak_label += f" ({self.peak_mu_sliders[peak_idx].get():.2f}°)"
             details = list(info.get("peak_details", []) or [])
-            total_area = self._xrd_fit_area(info)
-            total_height = self._xrd_fit_height(info)
+            curve_spec = curve_specs[i] if i < len(curve_specs) else None
+            if isinstance(curve_spec, dict):
+                total_area, total_height = self._fit_signal_area_and_height(
+                    curve_x,
+                    curve_spec.get("signal", []),
+                )
+                component_specs = {
+                    int(item.get("detail_index", -1)): item
+                    for item in curve_spec.get("components", [])
+                }
+            else:
+                total_area = self._xrd_fit_area(info)
+                total_height = self._xrd_fit_height(info)
+                component_specs = {}
             rows.append((peak_label, self._format_area(total_area), self._format_height(total_height), "", "100%", "100%"))
             detail_metrics = []
             for j, det in enumerate(details, start=1):
-                area = self._xrd_fit_area(info, det)
-                height = self._xrd_fit_height(info, det)
+                component_spec = component_specs.get(j - 1)
+                if component_spec is not None:
+                    area, height = self._fit_signal_area_and_height(
+                        curve_x,
+                        component_spec.get("signal", []),
+                    )
+                else:
+                    area = self._xrd_fit_area(info, det)
+                    height = self._xrd_fit_height(info, det)
                 detail_metrics.append((j, det, area, height))
             area_denominator = sum(max(0.0, area) for _j, _det, area, _height in detail_metrics)
             height_denominator = sum(max(0.0, height) for _j, _det, _area, height in detail_metrics)
@@ -1544,6 +1758,21 @@ class ControlPanelMixin:
                     )
                 )
         return rows
+
+    @staticmethod
+    def _fit_signal_area_and_height(x_values, signal_values) -> tuple[float, float]:
+        x = np.asarray(x_values, dtype=float)
+        signal = np.clip(np.asarray(signal_values, dtype=float), 0.0, None)
+        if signal.size == 0:
+            return 0.0, 0.0
+        height = float(np.nanmax(signal))
+        if x.size != signal.size:
+            return float(np.sum(signal)), height
+        try:
+            area = float(np.trapezoid(signal, x))
+        except AttributeError:
+            area = float(np.trapz(signal, x))
+        return area, height
 
     def _xrd_fit_area(self, info: dict, detail: dict | None = None) -> float:
         try:

@@ -404,9 +404,12 @@ def load_txt_file(file_path: str) -> tuple:
     """
     with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
         first_line = fh.readline().strip()
+        # Reuse the explicitly decoded stream.  Passing the filename back to
+        # np.loadtxt would use the Windows locale encoding and can fail when a
+        # UTF-8 sample name contains Chinese characters, even with skiprows=1.
+        data = np.loadtxt(fh)
 
     sample_name = first_line if first_line else _stem(file_path)
-    data = np.loadtxt(file_path, skiprows=1)
 
     if data.ndim != 2 or data.shape[1] < 2:
         raise ValueError(

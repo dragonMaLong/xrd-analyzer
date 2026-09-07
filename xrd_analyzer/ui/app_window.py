@@ -7,8 +7,10 @@ PyQt5 XRDApp 主类：
 """
 import csv
 import os
+import tempfile
 import threading
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,7 +31,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
 )
 
-from ..core.analysis import build_all_peak_info
+from ..core.analysis import build_all_peak_info, calculate_rfit_percent
 from ..core.fitting import (
     INTENSITY_RATIO,
     WAVELENGTHS,
@@ -40,11 +42,22 @@ from ..core.fitting import (
     solve_regularized_from_basis,
 )
 from ..io.file_reader import load_file as load_xrd_file
+from ..io.project_file import (
+    ALGORITHM_VERSION,
+    PROJECT_EXTENSION,
+    ProjectFormatError,
+    data_sha256,
+    file_sha256,
+    load_project,
+    materialize_project_snapshot,
+    save_project,
+    stable_state_sha256,
+)
 from ..update_checker import DEFAULT_UPDATE_REPOSITORY, UpdateInfo, check_for_update
 from ..updater import UpdateDownloadError, download_update, launch_update_and_exit
 from ..utils import resource_path
 from ..version import __version__
-from .control_panel_mixin import ControlPanelMixin
+from .control_panel_mixin import ControlPanelMixin, SAMPLE_STATUS_PROGRESS_ROLE
 from .import_dialog import XRDFileImportDialog
 from .l_curve_mixin import LCurveMixin
 from .plot_panel_mixin import PlotPanelMixin
@@ -66,14 +79,27 @@ class XRDSample:
     y_data: np.ndarray
     name: str
     metadata: dict
+    sample_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    data_fingerprint: str = ""
+    file_fingerprint: str = ""
     status: str = "pending"
     compare_visible: bool = True
+    parameter_state: dict = field(default_factory=dict)
     peak_states: list[dict] = field(default_factory=list)
     analysis_state: dict = field(default_factory=dict)
     baseline_state: dict = field(default_factory=dict)
     marker_label_state: dict = field(default_factory=dict)
     plot_view_state: dict = field(default_factory=dict)
+    size_visibility_state: dict = field(default_factory=dict)
+    size_total_inclusion_state: dict = field(default_factory=dict)
     results: dict = field(default_factory=dict)
+    runtime_plot_cache: dict = field(default_factory=dict, repr=False)
+    result_signature: str = ""
+    result_is_current: bool = False
+    project_path: str = ""
+    project_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
+    project_dirty: bool = True
+    project_revision: int = 0
 
 
 class _UiDispatcher(QObject):
@@ -178,6 +204,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
 
     def __init__(self):
         super().__init__()
+        QApplication.setOrganizationName("DragonScience")
+        QApplication.setApplicationName("XRDAnalyzer")
         self.root = self
         self.setWindowTitle(f"XRD晶粒尺寸分布分析-DragonScience V{APP_VERSION}")
         self._ui_dispatcher = _UiDispatcher()
@@ -202,7 +230,10 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.peak_color_buttons = []
         self.peak_visible_buttons = []
         self._building_peak_controls = False
-        self.manual_baseline_enabled = False
+        # The baseline is always part of the imported sample view.  Editing is
+        # a separate transient tool mode controlled by the Baseline button.
+        self.manual_baseline_enabled = True
+        self.manual_baseline_editing = True
         self.manual_baseline_edited = False
         self.manual_baseline_user_points = []
         self.manual_baseline_endpoint_y = {"left": None, "right": None}
@@ -211,6 +242,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self._manual_baseline_curve_item = None
         self._manual_baseline_anchor_items = []
         self._syncing_manual_baseline_anchor = False
+        self._manual_baseline_drag_anchor = None
+        self._manual_baseline_drag_anchor_id = None
         self.particle_size_min = 0.1
         self.particle_size_max = 100.0
         self.particle_size_step = 0.1
@@ -237,8 +270,38 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self._update_download_worker: UpdateDownloadWorker | None = None
         self._update_progress_dialog: QProgressDialog | None = None
         self._available_update_info = None
+        self._suspend_project_dirty = False
+        self._project_save_jobs: dict[str, str] = {}
+        self._file_load_jobs: dict[str, str] = {}
+        self._pending_file_loads: dict[str, dict] = {}
+        self._sample_status_tasks: dict[str, dict] = {}
+        self._project_io_progress_generation = 0
+        self._project_io_lock = threading.Lock()
+        self._project_io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xrd-project-io")
+        self._prepared_project_snapshot_lock = threading.Lock()
+        self._prepared_project_snapshot_generation = 0
+        self._prepared_project_snapshot_jobs: dict[str, int] = {}
+        self._prepared_project_snapshots: dict[str, tuple[int, str, str]] = {}
+        self._prepared_project_snapshot_closing = False
+        snapshot_cache_root = QStandardPaths.writableLocation(QStandardPaths.CacheLocation)
+        if not snapshot_cache_root:
+            snapshot_cache_root = tempfile.gettempdir()
+        self._prepared_project_snapshot_dir = (
+            Path(snapshot_cache_root) / "prepared-projects" / str(uuid.uuid4())
+        )
+        self._suspend_plot_updates = False
+        self._restoring_sample_state = False
+        self._transient_runtime_plot_cache: dict = {}
+        self._sample_render_timer = QTimer(self)
+        self._sample_render_timer.setSingleShot(True)
+        self._sample_render_timer.timeout.connect(self._render_selected_sample)
         self._fit_cache = None
+        self.fit_quality_history = []
+        self.current_rfit_percent = None
         self._fit_worker_running = False
+        self._fit_task_sample_id: str | None = None
+        self._fit_task_token: str | None = None
+        self._fit_task_operation = ""
         self._alpha_fast_running = False
         self._alpha_fast_pending = False
         self._alpha_fast_revision = 0
@@ -254,6 +317,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             self.setWindowIcon(QIcon(icon_path))
 
         self._setup_ui()
+        self._update_window_title()
         QTimer.singleShot(AUTO_UPDATE_CHECK_DELAY_MS, self._auto_check_for_updates)
 
     def _setup_ui(self):
@@ -309,6 +373,1054 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.setup_plots()
         self.bind_events()
         self.statusBar().showMessage("打开或拖入 TXT、RAW 文件")
+
+    def _update_window_title(self) -> None:
+        title = f"XRD晶粒尺寸分布分析-DragonScience V{APP_VERSION}"
+        if 0 <= self.active_sample_index < len(self.samples):
+            sample = self.samples[self.active_sample_index]
+            dirty = " *" if sample.project_dirty else ""
+            title += f" — {sample.name}{dirty}"
+        self.setWindowTitle(title)
+
+    def _mark_project_dirty(self, sample: XRDSample | None = None) -> None:
+        if getattr(self, "_suspend_project_dirty", False):
+            return
+        if sample is None and 0 <= self.active_sample_index < len(self.samples):
+            sample = self.samples[self.active_sample_index]
+        if sample is None:
+            return
+        sample.project_dirty = True
+        sample.project_revision += 1
+        if hasattr(self, "_ui_dispatcher"):
+            self.ui(self._update_window_title)
+
+    def _set_project_clean(self, sample: XRDSample | None = None) -> None:
+        if sample is None and 0 <= self.active_sample_index < len(self.samples):
+            sample = self.samples[self.active_sample_index]
+        if sample is not None:
+            sample.project_dirty = False
+        self._update_window_title()
+
+    def _current_parameter_state(self) -> dict:
+        source = self.source_var.get() if getattr(self, "source_var", None) is not None else "Cu"
+        alpha = self.slider_alpha.get() if hasattr(self, "slider_alpha") else 1.0
+        return {
+            "source": str(source),
+            "alpha": float(alpha),
+            "particle_size_min": float(getattr(self, "particle_size_min", 0.1)),
+            "particle_size_max": float(getattr(self, "particle_size_max", 100.0)),
+            "particle_size_step": float(getattr(self, "particle_size_step", 0.1)),
+            "instrument_fwhm": float(getattr(self, "instrument_fwhm", 0.0)),
+            "regularization_method": str(getattr(self, "regularization_method", "l2") or "l2"),
+            "peak_kernel": str(getattr(self, "peak_kernel", "pearson7") or "pearson7"),
+            "size_distribution_mode": str(getattr(self, "size_distribution_mode", "volume") or "volume"),
+        }
+
+    def _apply_parameter_state(self, state: dict | None) -> None:
+        state = dict(state or {})
+        self.particle_size_min = float(state.get("particle_size_min", 0.1))
+        self.particle_size_max = float(state.get("particle_size_max", 100.0))
+        self.particle_size_step = float(state.get("particle_size_step", 0.1))
+        self.instrument_fwhm = float(state.get("instrument_fwhm", 0.0))
+        self.regularization_method = str(state.get("regularization_method", "l2") or "l2")
+        self.peak_kernel = str(state.get("peak_kernel", "pearson7") or "pearson7")
+        self.size_distribution_mode = (
+            "number" if str(state.get("size_distribution_mode", "volume")).lower() == "number" else "volume"
+        )
+        if getattr(self, "source_var", None) is not None:
+            combo = getattr(self, "source_menu", None)
+            if combo is not None:
+                combo.blockSignals(True)
+            self.source_var.set(state.get("source", "Cu"))
+            if combo is not None:
+                combo.blockSignals(False)
+        if hasattr(self, "slider_alpha"):
+            self.slider_alpha.set(float(state.get("alpha", 1.0)), emit=False)
+
+    def _save_current_parameter_state(self) -> None:
+        if not (0 <= self.active_sample_index < len(self.samples)):
+            return
+        sample = self.samples[self.active_sample_index]
+        state = self._current_parameter_state()
+        if sample.parameter_state != state:
+            computation_keys = {
+                "source",
+                "alpha",
+                "particle_size_min",
+                "particle_size_max",
+                "particle_size_step",
+                "instrument_fwhm",
+                "regularization_method",
+                "peak_kernel",
+            }
+            calculation_changed = any(
+                sample.parameter_state.get(key) != state.get(key) for key in computation_keys
+            )
+            sample.parameter_state = state
+            if calculation_changed:
+                sample.result_is_current = False
+            self._mark_project_dirty()
+
+    @staticmethod
+    def _calculation_peak_states(states: list[dict]) -> list[dict]:
+        return [
+            {
+                "checked": bool(item.get("checked", True)),
+                "value": round(float(item.get("value", 0.0)), 8),
+            }
+            for item in states
+        ]
+
+    def _result_signature_for_sample(self, sample: XRDSample) -> str:
+        calculation_parameters = {
+            key: value
+            for key, value in sample.parameter_state.items()
+            if key != "size_distribution_mode"
+        }
+        return stable_state_sha256(
+            {
+                "algorithm_version": ALGORITHM_VERSION,
+                "data_sha256": sample.data_fingerprint or data_sha256(sample.x_data, sample.y_data),
+                "parameters": calculation_parameters,
+                "analysis": sample.analysis_state,
+                "peaks": self._calculation_peak_states(sample.peak_states),
+                "baseline": sample.baseline_state,
+            }
+        )
+
+    @staticmethod
+    def _compact_fit_curve_snapshot_from_data(curve_data: dict | None) -> dict | None:
+        if not isinstance(curve_data, dict):
+            return None
+        peaks = []
+        for peak_spec in curve_data.get("peak_specs", []) or []:
+            try:
+                peak_id = int(peak_spec["peak_id"])
+                peak_signal = np.asarray(peak_spec["signal"], dtype=float)
+            except (KeyError, TypeError, ValueError):
+                continue
+            components = []
+            for component in peak_spec.get("components", []) or []:
+                try:
+                    components.append(
+                        {
+                            "detail_index": int(component["detail_index"]),
+                            "signal": np.asarray(component["signal"], dtype=float),
+                        }
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            peaks.append(
+                {
+                    "peak_id": peak_id,
+                    "signal": peak_signal,
+                    "components": components,
+                }
+            )
+        if not peaks:
+            return None
+        return {"version": 1, "peaks": peaks}
+
+    @classmethod
+    def _compact_fit_curve_snapshot_from_results(cls, results: dict) -> dict | None:
+        existing = results.get("fit_curve_snapshot")
+        if isinstance(existing, dict) and existing.get("peaks"):
+            return existing
+        try:
+            x = np.asarray(results["x_segment"], dtype=float)
+            y = np.asarray(results["y_segment"], dtype=float)
+            peak_infos = list(results.get("all_peak_info") or [])
+            active_indices = list(results.get("result_active_peak_indices") or [])
+            all_basis_k1 = list(results.get("all_basis_k1") or [])
+            all_basis_k2 = list(results.get("all_basis_k2") or [])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if x.size == 0 or not peak_infos:
+            return None
+        y_scale = float(np.nanmax(y)) if y.size else 1.0
+        curve_specs = []
+        for i, info in enumerate(peak_infos):
+            try:
+                peak_id = int(info.get("peak_id", active_indices[i] if i < len(active_indices) else i))
+                f_segment = np.asarray(info["f_segment"], dtype=float)
+                basis_k1 = np.asarray(
+                    info.get("basis_k1", all_basis_k1[i] if i < len(all_basis_k1) else None),
+                    dtype=float,
+                )
+                basis_k2 = np.asarray(
+                    info.get("basis_k2", all_basis_k2[i] if i < len(all_basis_k2) else None),
+                    dtype=float,
+                )
+                if basis_k1.ndim != 2 or basis_k2.ndim != 2:
+                    return None
+                peak_signal = (basis_k1.dot(f_segment) + basis_k2.dot(f_segment)) * y_scale
+            except (KeyError, TypeError, ValueError, IndexError):
+                return None
+            components = []
+            for detail_index, detail in enumerate(info.get("peak_details", []) or []):
+                indices = np.asarray(detail.get("indices", []), dtype=int)
+                indices = indices[
+                    (indices >= 0)
+                    & (indices < f_segment.size)
+                    & (indices < basis_k1.shape[1])
+                    & (indices < basis_k2.shape[1])
+                ]
+                if indices.size == 0:
+                    continue
+                weights = f_segment[indices]
+                component_signal = (
+                    basis_k1[:, indices].dot(weights)
+                    + basis_k2[:, indices].dot(weights)
+                ) * y_scale
+                components.append(
+                    {
+                        "detail_index": int(detail_index),
+                        "signal": component_signal,
+                    }
+                )
+            curve_specs.append(
+                {
+                    "peak_id": peak_id,
+                    "signal": peak_signal,
+                    "components": components,
+                }
+            )
+        return {"version": 1, "peaks": curve_specs}
+
+    def _sample_to_project_record(self, sample: XRDSample) -> dict:
+        # Full Kα1/Kα2 basis matrices scale as peaks × angles × particle-size
+        # bins and can reach hundreds of MB. Projects only need the derived
+        # one-dimensional display curves; bases are rebuilt by the next fit.
+        source_results = dict(sample.results or {})
+        runtime_curve_data = (sample.runtime_plot_cache or {}).get("fit_curve_data")
+        curve_snapshot = self._compact_fit_curve_snapshot_from_data(runtime_curve_data)
+        if curve_snapshot is None:
+            curve_snapshot = self._compact_fit_curve_snapshot_from_results(source_results)
+
+        persistent_results = {}
+        for key, value in source_results.items():
+            if key in {"_fit_cache", "all_basis_k1", "all_basis_k2", "fit_curve_snapshot"}:
+                continue
+            if key == "all_peak_info":
+                persistent_results[key] = [
+                    {
+                        info_key: info_value
+                        for info_key, info_value in dict(info).items()
+                        if info_key not in {"basis_k1", "basis_k2"}
+                    }
+                    for info in (value or [])
+                ]
+            else:
+                persistent_results[key] = value
+        if curve_snapshot is not None:
+            persistent_results["fit_curve_snapshot"] = curve_snapshot
+        return {
+            "sample_id": str(sample.sample_id),
+            "path": str(sample.path),
+            "name": str(sample.name),
+            "metadata": dict(sample.metadata or {}),
+            "data_fingerprint": str(sample.data_fingerprint or data_sha256(sample.x_data, sample.y_data)),
+            "file_fingerprint": str(sample.file_fingerprint or ""),
+            "status": str(sample.status),
+            "compare_visible": bool(sample.compare_visible),
+            "parameter_state": dict(sample.parameter_state or {}),
+            "peak_states": list(sample.peak_states or []),
+            "analysis_state": dict(sample.analysis_state or {}),
+            "baseline_state": dict(sample.baseline_state or {}),
+            "marker_label_state": dict(sample.marker_label_state or {}),
+            "plot_view_state": dict(sample.plot_view_state or {}),
+            "size_visibility_state": dict(sample.size_visibility_state or {}),
+            "size_total_inclusion_state": dict(sample.size_total_inclusion_state or {}),
+            "result_signature": str(sample.result_signature or ""),
+            "result_is_current": bool(sample.result_is_current),
+            "x_data": np.asarray(sample.x_data, dtype=float),
+            "y_data": np.asarray(sample.y_data, dtype=float),
+            "results": persistent_results,
+        }
+
+    @staticmethod
+    def _remove_prepared_snapshot_file(path: str | Path | None) -> None:
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _prepared_snapshot_for_revision(
+        self,
+        sample_id: str,
+        revision: int,
+        project_uuid: str,
+    ) -> str | None:
+        with self._prepared_project_snapshot_lock:
+            snapshot = self._prepared_project_snapshots.get(str(sample_id))
+        if snapshot is None:
+            return None
+        snapshot_revision, snapshot_project_uuid, snapshot_path = snapshot
+        if snapshot_revision != int(revision) or snapshot_project_uuid != str(project_uuid):
+            return None
+        if not Path(snapshot_path).is_file():
+            return None
+        return snapshot_path
+
+    def _queue_prepared_project_snapshot(self, sample: XRDSample) -> None:
+        """Precompress one exact calculated revision for a faster later Save."""
+        if not sample.results:
+            return
+        sample_id = str(sample.sample_id)
+        revision = int(sample.project_revision)
+        project_uuid = str(sample.project_uuid)
+        record = self._sample_to_project_record(sample)
+        snapshot_path = self._prepared_project_snapshot_dir / f"{uuid.uuid4()}{PROJECT_EXTENSION}"
+
+        with self._prepared_project_snapshot_lock:
+            if self._prepared_project_snapshot_closing:
+                return
+            self._prepared_project_snapshot_generation += 1
+            generation = self._prepared_project_snapshot_generation
+            self._prepared_project_snapshot_jobs[sample_id] = generation
+
+        def worker() -> None:
+            error = None
+            try:
+                snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._project_io_lock:
+                    save_project(
+                        snapshot_path,
+                        [record],
+                        active_sample_index=0,
+                        app_version=APP_VERSION,
+                        project_uuid=project_uuid,
+                    )
+            except Exception as exc:
+                error = exc
+
+            keep_snapshot = False
+            old_snapshot_path = None
+            with self._prepared_project_snapshot_lock:
+                is_latest = self._prepared_project_snapshot_jobs.get(sample_id) == generation
+                if is_latest:
+                    self._prepared_project_snapshot_jobs.pop(sample_id, None)
+                if is_latest and error is None and not self._prepared_project_snapshot_closing:
+                    old_snapshot = self._prepared_project_snapshots.get(sample_id)
+                    if old_snapshot is not None:
+                        old_snapshot_path = old_snapshot[2]
+                    self._prepared_project_snapshots[sample_id] = (
+                        revision,
+                        project_uuid,
+                        str(snapshot_path),
+                    )
+                    keep_snapshot = True
+
+            if old_snapshot_path and old_snapshot_path != str(snapshot_path):
+                self._remove_prepared_snapshot_file(old_snapshot_path)
+            if not keep_snapshot:
+                self._remove_prepared_snapshot_file(snapshot_path)
+
+        try:
+            self._project_io_executor.submit(worker)
+        except Exception:
+            with self._prepared_project_snapshot_lock:
+                if self._prepared_project_snapshot_jobs.get(sample_id) == generation:
+                    self._prepared_project_snapshot_jobs.pop(sample_id, None)
+
+    def _discard_prepared_project_snapshot(self, sample_id: str) -> None:
+        sample_id = str(sample_id)
+        with self._prepared_project_snapshot_lock:
+            self._prepared_project_snapshot_jobs.pop(sample_id, None)
+            snapshot = self._prepared_project_snapshots.pop(sample_id, None)
+        if snapshot is not None:
+            self._remove_prepared_snapshot_file(snapshot[2])
+
+    def _close_prepared_project_snapshots(self) -> None:
+        with self._prepared_project_snapshot_lock:
+            self._prepared_project_snapshot_closing = True
+            self._prepared_project_snapshot_jobs.clear()
+            paths = [snapshot[2] for snapshot in self._prepared_project_snapshots.values()]
+            self._prepared_project_snapshots.clear()
+        for path in paths:
+            self._remove_prepared_snapshot_file(path)
+        try:
+            self._prepared_project_snapshot_dir.rmdir()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _sample_from_project_record(record: dict) -> XRDSample:
+        size_visibility_state = dict(record.get("size_visibility_state") or {})
+        if "size_total_inclusion_state" in record:
+            size_total_inclusion_state = dict(record.get("size_total_inclusion_state") or {})
+        else:
+            # Before the controls were separated, hiding a Peak also removed
+            # it from Total. Preserve that Total when opening an older project.
+            size_total_inclusion_state = dict(size_visibility_state)
+        return XRDSample(
+            path=str(record.get("path") or ""),
+            x_data=np.asarray(record.get("x_data", []), dtype=float),
+            y_data=np.asarray(record.get("y_data", []), dtype=float),
+            name=str(record.get("name") or "样品"),
+            metadata=dict(record.get("metadata") or {}),
+            sample_id=str(record.get("sample_id") or uuid.uuid4()),
+            data_fingerprint=str(record.get("data_fingerprint") or ""),
+            file_fingerprint=str(record.get("file_fingerprint") or ""),
+            status=str(record.get("status") or "pending"),
+            compare_visible=bool(record.get("compare_visible", True)),
+            parameter_state=dict(record.get("parameter_state") or {}),
+            peak_states=list(record.get("peak_states") or []),
+            analysis_state=dict(record.get("analysis_state") or {}),
+            baseline_state=dict(record.get("baseline_state") or {}),
+            marker_label_state=dict(record.get("marker_label_state") or {}),
+            plot_view_state=dict(record.get("plot_view_state") or {}),
+            size_visibility_state=size_visibility_state,
+            size_total_inclusion_state=size_total_inclusion_state,
+            results=dict(record.get("results") or {}),
+            result_signature=str(record.get("result_signature") or ""),
+            result_is_current=bool(record.get("result_is_current", False)),
+        )
+
+    def _capture_active_sample_state(self) -> None:
+        if not (0 <= self.active_sample_index < len(self.samples)):
+            return
+        self._save_current_peak_states()
+        self._save_current_analysis_state()
+        self._save_current_parameter_state()
+        self._save_current_manual_baseline_state()
+        self._save_current_marker_label_state()
+        self._save_current_plot_view_state()
+        self._save_current_size_visibility_state()
+        self._save_current_size_total_inclusion_state()
+
+    def _suggested_project_name(self, sample: XRDSample) -> str:
+        if sample.project_path:
+            base = Path(sample.project_path).stem
+        elif sample.path:
+            base = Path(sample.path).stem
+        else:
+            base = str(sample.name or "XRD工程")
+        for char in '<>:"/\\|?*':
+            base = base.replace(char, "_")
+        return (base.strip() or "XRD工程") + PROJECT_EXTENSION
+
+    def _project_operation_blocked_by_calculation(self) -> bool:
+        running = bool(
+            getattr(self, "_fit_worker_running", False)
+            or getattr(self, "_alpha_fast_running", False)
+        )
+        if running:
+            QMessageBox.information(self, "计算进行中", "请等待当前计算结束或先停止计算，再操作工程文件。")
+        return running
+
+    @staticmethod
+    def _idle_sample_status_tooltip(sample: XRDSample) -> str:
+        if sample.status == "complete" and sample.result_is_current:
+            return "计算完成，结果与当前参数一致"
+        if sample.status == "complete":
+            return "已恢复上一次计算结果；当前参数或算法已变化，建议重新计算"
+        return "待计算"
+
+    def _sample_row_by_id(self, sample_id: str) -> int | None:
+        for row, sample in enumerate(self.samples):
+            if str(sample.sample_id) == str(sample_id):
+                return row
+        return None
+
+    def _update_sample_status_cell(self, sample_id: str) -> None:
+        row = self._sample_row_by_id(sample_id)
+        if row is None or not hasattr(self, "sample_table"):
+            return
+        item = self.sample_table.item(row, getattr(self, "sample_status_col", 2))
+        if item is None:
+            return
+        task = self._sample_status_tasks.get(str(sample_id))
+        if task is not None:
+            progress = max(0, min(100, int(task.get("progress", 0))))
+            operation = str(task.get("operation") or "处理中")
+            stage = str(task.get("stage") or operation)
+            item.setData(SAMPLE_STATUS_PROGRESS_ROLE, progress)
+            item.setToolTip(f"{operation}：{stage} · {progress}%")
+        else:
+            sample = self.samples[row]
+            item.setData(SAMPLE_STATUS_PROGRESS_ROLE, None)
+            item.setIcon(self._status_icon(sample.status))
+            item.setToolTip(self._idle_sample_status_tooltip(sample))
+        self.sample_table.viewport().update(self.sample_table.visualItemRect(item))
+
+    def _set_sample_status_progress(
+        self,
+        sample_id: str,
+        value: int,
+        operation: str,
+        stage: str = "",
+        *,
+        task_token: str | None = None,
+    ) -> None:
+        sample_id = str(sample_id)
+        self._sample_status_tasks[sample_id] = {
+            "progress": max(0, min(100, int(value))),
+            "operation": str(operation),
+            "stage": str(stage or operation),
+            "task_token": str(task_token or ""),
+        }
+        self._update_sample_status_cell(sample_id)
+
+    def _clear_sample_status_progress(
+        self,
+        sample_id: str,
+        *,
+        task_token: str | None = None,
+    ) -> None:
+        sample_id = str(sample_id)
+        current = self._sample_status_tasks.get(sample_id)
+        if current is None:
+            return
+        if task_token is not None and str(current.get("task_token") or "") != str(task_token):
+            return
+        self._sample_status_tasks.pop(sample_id, None)
+        self._update_sample_status_cell(sample_id)
+
+    def _complete_sample_status_progress(self, sample_id: str, task_token: str) -> None:
+        current = self._sample_status_tasks.get(str(sample_id))
+        if current is None or str(current.get("task_token") or "") != str(task_token):
+            return
+        self._set_sample_status_progress(
+            sample_id,
+            100,
+            str(current.get("operation") or "处理中"),
+            "完成",
+            task_token=task_token,
+        )
+        QTimer.singleShot(
+            180,
+            lambda sid=str(sample_id), token=str(task_token): self._clear_sample_status_progress(
+                sid,
+                task_token=token,
+            ),
+        )
+
+    def _on_fit_progress_value_changed(self, value: int) -> None:
+        if not getattr(self, "_fit_worker_running", False):
+            return
+        sample_id = getattr(self, "_fit_task_sample_id", None)
+        task_token = getattr(self, "_fit_task_token", None)
+        if not sample_id or not task_token:
+            return
+        self._set_sample_status_progress(
+            sample_id,
+            value,
+            getattr(self, "_fit_task_operation", "计算") or "计算",
+            "正在计算",
+            task_token=task_token,
+        )
+
+    def _finish_sample_calculation_status(
+        self,
+        sample_id: str,
+        task_token: str,
+        success: bool,
+    ) -> None:
+        if success:
+            self._complete_sample_status_progress(sample_id, task_token)
+        else:
+            self._clear_sample_status_progress(sample_id, task_token=task_token)
+        if getattr(self, "_fit_task_token", None) == task_token:
+            self._fit_task_sample_id = None
+            self._fit_task_token = None
+            self._fit_task_operation = ""
+
+    def _project_io_job_is_active(self, job_token: str) -> bool:
+        return job_token in self._project_save_jobs.values() or job_token in self._file_load_jobs.values()
+
+    def _update_pending_file_load_progress(
+        self,
+        job_token: str,
+        value: int,
+        stage: str,
+    ) -> None:
+        pending_items = list(self._pending_file_loads.items())
+        for offset, (_key, pending) in enumerate(pending_items):
+            if pending.get("job_token") != job_token:
+                continue
+            pending["progress"] = max(0, min(100, int(value)))
+            pending["stage"] = str(stage)
+            row = len(self.samples) + offset
+            status_item = self.sample_table.item(
+                row,
+                getattr(self, "sample_status_col", 2),
+            )
+            if status_item is not None:
+                status_item.setData(SAMPLE_STATUS_PROGRESS_ROLE, pending["progress"])
+                status_item.setToolTip(f"{pending['stage']} · {pending['progress']}%")
+                self.sample_table.viewport().update(
+                    self.sample_table.visualItemRect(status_item)
+                )
+            return
+
+    def _update_project_io_progress(
+        self,
+        job_token: str,
+        value: int,
+        operation: str,
+        stage: str,
+        file_name: str,
+    ) -> None:
+        if not self._project_io_job_is_active(job_token):
+            return
+        self._update_pending_file_load_progress(job_token, value, stage)
+        for sample_id, save_token in self._project_save_jobs.items():
+            if save_token == job_token:
+                self._set_sample_status_progress(
+                    sample_id,
+                    value,
+                    operation,
+                    stage,
+                    task_token=job_token,
+                )
+                break
+        if getattr(self, "_fit_worker_running", False) or getattr(self, "_alpha_fast_running", False):
+            return
+        self._project_io_progress_generation += 1
+        value = max(0, min(100, int(value)))
+        self.progress_label.setText(f"{operation}：{stage} · {value}%")
+        self.progress_label.setToolTip(str(file_name))
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(value)
+        self.progress_label.show()
+        self.progress_bar.show()
+
+    def _finish_project_io_progress(self, message: str, *, success: bool) -> None:
+        if self._project_save_jobs or self._file_load_jobs:
+            return
+        if getattr(self, "_fit_worker_running", False) or getattr(self, "_alpha_fast_running", False):
+            return
+        self._project_io_progress_generation += 1
+        generation = self._project_io_progress_generation
+        self.progress_label.setText(message)
+        if success:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+        self.progress_label.show()
+        self.progress_bar.show()
+
+        def hide_when_idle() -> None:
+            if generation != self._project_io_progress_generation:
+                return
+            if self._project_save_jobs or self._file_load_jobs:
+                return
+            if getattr(self, "_fit_worker_running", False) or getattr(self, "_alpha_fast_running", False):
+                return
+            self.progress_label.hide()
+            self.progress_bar.hide()
+
+        QTimer.singleShot(1600 if success else 3000, hide_when_idle)
+
+    def save_project_file(
+        self,
+        _checked: bool = False,
+        *,
+        save_as: bool = False,
+        sample_index: int | None = None,
+    ) -> bool:
+        """Save exactly one sample and its current analysis to one project file."""
+        if self._project_operation_blocked_by_calculation():
+            return False
+        index = self.active_sample_index if sample_index is None else int(sample_index)
+        if not (0 <= index < len(self.samples)):
+            QMessageBox.information(self, "保存工程", "请先选择一个样品。")
+            return False
+        if index == self.active_sample_index:
+            self._capture_active_sample_state()
+        sample = self.samples[index]
+        if sample.sample_id in self._project_save_jobs:
+            self.statusBar().showMessage(f"样品“{sample.name}”正在后台保存，请稍候", 3000)
+            return False
+
+        target = None if save_as else sample.project_path
+        if not target:
+            initial_dir = str(
+                Path(self.import_directory or Path.home()) / self._suggested_project_name(sample)
+            )
+            target, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "保存 XRD 工程",
+                initial_dir,
+                "XRD Analyzer 工程 (*.xrdproj);;所有文件 (*)",
+            )
+            if not target:
+                return False
+            if not str(target).lower().endswith(PROJECT_EXTENSION):
+                target = str(target) + PROJECT_EXTENSION
+
+        target = str(Path(target).resolve())
+        record = self._sample_to_project_record(sample)
+        saved_revision = int(sample.project_revision)
+        sample_id = str(sample.sample_id)
+        project_uuid = str(sample.project_uuid)
+        job_token = str(uuid.uuid4())
+        self._project_save_jobs[sample_id] = job_token
+        self._set_sample_status_progress(
+            sample_id,
+            0,
+            "保存工程",
+            "准备保存",
+            task_token=job_token,
+        )
+
+        def worker() -> None:
+            error = None
+            progress = lambda value, stage: self.ui(
+                self._update_project_io_progress,
+                job_token,
+                value,
+                "保存工程",
+                stage,
+                Path(target).name,
+            )
+            try:
+                # Serialize project writes so several large manual saves
+                # cannot saturate the CPU at once.
+                with self._project_io_lock:
+                    prepared_snapshot = self._prepared_snapshot_for_revision(
+                        sample_id,
+                        saved_revision,
+                        project_uuid,
+                    )
+                    if prepared_snapshot:
+                        try:
+                            materialize_project_snapshot(
+                                prepared_snapshot,
+                                target,
+                                progress_callback=progress,
+                            )
+                        except Exception:
+                            # A stale or externally removed cache must never
+                            # prevent a normal, authoritative project save.
+                            save_project(
+                                target,
+                                [record],
+                                active_sample_index=0,
+                                app_version=APP_VERSION,
+                                project_uuid=project_uuid,
+                                progress_callback=progress,
+                            )
+                    else:
+                        save_project(
+                            target,
+                            [record],
+                            active_sample_index=0,
+                            app_version=APP_VERSION,
+                            project_uuid=project_uuid,
+                            progress_callback=progress,
+                        )
+            except Exception as exc:
+                error = str(exc)
+            self.ui(
+                self._finish_project_save,
+                sample_id,
+                job_token,
+                target,
+                saved_revision,
+                error,
+            )
+
+        try:
+            self._project_io_executor.submit(worker)
+        except Exception as exc:
+            self._project_save_jobs.pop(sample_id, None)
+            self._clear_sample_status_progress(sample_id, task_token=job_token)
+            QMessageBox.warning(self, "保存工程失败", str(exc))
+            return False
+
+        self.statusBar().showMessage(f"正在后台保存工程：{Path(target).name}")
+        return True
+
+    def _finish_project_save(
+        self,
+        sample_id: str,
+        job_token: str,
+        target: str,
+        saved_revision: int,
+        error: str | None,
+    ) -> None:
+        if self._project_save_jobs.get(sample_id) != job_token:
+            return
+        self._project_save_jobs.pop(sample_id, None)
+        sample = next((item for item in self.samples if item.sample_id == sample_id), None)
+        if error:
+            self._clear_sample_status_progress(sample_id, task_token=job_token)
+            self._finish_project_io_progress("工程保存失败", success=False)
+            QMessageBox.warning(self, "保存工程失败", error)
+            self.statusBar().showMessage(f"工程保存失败：{Path(target).name}", 5000)
+            return
+
+        if sample is not None:
+            sample.project_path = target
+            if sample.project_revision == saved_revision:
+                sample.project_dirty = False
+            self.settings.setValue("recent_project", target)
+            self.refresh_sample_table()
+        self._update_window_title()
+        if sample is not None and sample.project_dirty:
+            self.statusBar().showMessage(
+                f"工程快照已保存：{Path(target).name}；保存期间产生了新更改",
+                6000,
+            )
+        else:
+            self.statusBar().showMessage(f"工程已保存：{Path(target).name}", 4000)
+        self._complete_sample_status_progress(sample_id, job_token)
+        self._finish_project_io_progress("工程保存完成", success=True)
+
+    def _read_project_sample(
+        self,
+        path: str | Path,
+        *,
+        progress_callback=None,
+    ) -> tuple[XRDSample, bool]:
+        payload = load_project(path, progress_callback=progress_callback)
+        records = list(payload.get("samples", []))
+        if len(records) != 1:
+            raise ProjectFormatError("工程中没有样品")
+
+        sample = self._sample_from_project_record(records[0])
+        # ``file_name`` describes the artifact the user actually imported,
+        # whereas ``sample_name`` remains the specimen name recorded inside
+        # the original RAW/TXT data. Project variants must therefore show
+        # their own complete .xrdproj filenames in the parameter panel.
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata["file_name"] = Path(path).name
+        incompatible_algorithm = str(payload.get("algorithm_version") or "") != ALGORITHM_VERSION
+        sample.project_path = str(Path(path).resolve())
+        sample.project_uuid = str(payload.get("project_uuid") or uuid.uuid4())
+        sample.project_dirty = False
+        sample.result_is_current = bool(
+            not incompatible_algorithm
+            and sample.results
+            and sample.result_signature
+            and sample.result_signature == self._result_signature_for_sample(sample)
+        )
+        return sample, incompatible_algorithm
+
+    def load_project_file(self, path: str | Path) -> bool:
+        """Compatibility entry point for importing one project file."""
+        return self._start_file_load(path)
+
+    def _start_file_load(self, path: str | Path) -> bool:
+        """Load TXT, RAW, or a project in the background with stage progress."""
+        if self._project_operation_blocked_by_calculation():
+            return False
+        key = self._path_key(path)
+        if key in self._file_load_jobs or any(
+            key in self._sample_import_keys(sample) for sample in self.samples
+        ):
+            self.statusBar().showMessage(f"文件已在列表中：{Path(path).name}", 3000)
+            return False
+        resolved_path = str(Path(path).resolve())
+        is_project = Path(resolved_path).suffix.lower() == PROJECT_EXTENSION
+        operation = "读取工程" if is_project else "读取数据"
+        parameter_state = self._current_parameter_state()
+        peak_states = self._default_peak_states()
+        job_token = str(uuid.uuid4())
+        self._file_load_jobs[key] = job_token
+        self._pending_file_loads[key] = {
+            "job_token": job_token,
+            "path": resolved_path,
+            "is_project": is_project,
+            "progress": 0,
+            "stage": "等待后台读取",
+        }
+        self.refresh_sample_table()
+        self._update_project_io_progress(
+            job_token,
+            0,
+            operation,
+            "等待后台读取",
+            Path(resolved_path).name,
+        )
+
+        def worker() -> None:
+            sample = None
+            incompatible_algorithm = False
+            error = None
+            progress = lambda value, stage: self.ui(
+                self._update_project_io_progress,
+                job_token,
+                value,
+                operation,
+                stage,
+                Path(resolved_path).name,
+            )
+            try:
+                with self._project_io_lock:
+                    if is_project:
+                        sample, incompatible_algorithm = self._read_project_sample(
+                            resolved_path,
+                            progress_callback=progress,
+                        )
+                    else:
+                        sample = self._load_sample_from_path(
+                            resolved_path,
+                            parameter_state=parameter_state,
+                            peak_states=peak_states,
+                            progress_callback=progress,
+                        )
+            except Exception as exc:
+                error = str(exc)
+            self.ui(
+                self._finish_file_load,
+                key,
+                job_token,
+                resolved_path,
+                sample,
+                incompatible_algorithm,
+                is_project,
+                error,
+            )
+
+        try:
+            self._project_io_executor.submit(worker)
+        except Exception as exc:
+            self._file_load_jobs.pop(key, None)
+            self._pending_file_loads.pop(key, None)
+            self.refresh_sample_table()
+            self._finish_project_io_progress("文件读取失败", success=False)
+            QMessageBox.warning(self, "读取文件失败", str(exc))
+            return False
+        self.statusBar().showMessage(f"正在后台读取：{Path(path).name}")
+        return True
+
+    def _finish_file_load(
+        self,
+        key: str,
+        job_token: str,
+        path: str,
+        sample: XRDSample | None,
+        incompatible_algorithm: bool,
+        is_project: bool,
+        error: str | None,
+    ) -> None:
+        if self._file_load_jobs.get(key) != job_token:
+            return
+        self._file_load_jobs.pop(key, None)
+        self._pending_file_loads.pop(key, None)
+        if error or sample is None:
+            self.refresh_sample_table()
+            self._finish_project_io_progress("文件读取失败", success=False)
+            QMessageBox.warning(self, "读取文件失败", error or "文件中没有有效数据")
+            self.statusBar().showMessage(f"文件读取失败：{Path(path).name}", 5000)
+            return
+
+        if any(key in self._sample_import_keys(item) for item in self.samples):
+            self.refresh_sample_table()
+            self._finish_project_io_progress("文件已在列表中", success=True)
+            return
+        first_index = len(self.samples)
+        if sample.sample_id in {item.sample_id for item in self.samples}:
+            sample.sample_id = str(uuid.uuid4())
+        self.samples.append(sample)
+
+        clean_states = [item.project_dirty for item in self.samples]
+        self._suspend_project_dirty = True
+        try:
+            self.refresh_sample_table()
+            self.select_sample(first_index)
+        finally:
+            self._suspend_project_dirty = False
+            for item, dirty in zip(self.samples, clean_states):
+                item.project_dirty = dirty
+            self._update_window_title()
+        if is_project:
+            self.settings.setValue("recent_project", path)
+        details = []
+        if incompatible_algorithm:
+            details.append("历史算法结果已恢复，建议重新计算")
+        suffix = "；" + "；".join(details) if details else ""
+        kind = "工程" if is_project else "数据"
+        self.statusBar().showMessage(f"已导入{kind}：{Path(path).name}{suffix}", 6000)
+        self._finish_project_io_progress(f"{kind}读取完成", success=True)
+
+    def _selected_sample_rows(self) -> list[int]:
+        table = getattr(self, "sample_table", None)
+        if table is None:
+            return []
+        return sorted({index.row() for index in table.selectedIndexes()})
+
+    def _build_sample_context_menu(self, rows: list[int]) -> QtWidgets.QMenu:
+        menu = QtWidgets.QMenu(self.sample_table)
+        delete_action = menu.addAction("删除")
+        delete_action.triggered.connect(
+            lambda _checked=False, selected=tuple(rows): self._remove_sample_rows(selected)
+        )
+        if len(rows) == 1:
+            row = rows[0]
+            menu.addSeparator()
+            save_action = menu.addAction("保存工程")
+            save_action.triggered.connect(
+                lambda _checked=False, index=row: self.save_project_file(sample_index=index)
+            )
+            save_as_action = menu.addAction("另存为工程")
+            save_as_action.triggered.connect(
+                lambda _checked=False, index=row: self.save_project_file(
+                    save_as=True, sample_index=index
+                )
+            )
+        return menu
+
+    def _show_sample_context_menu(self, pos) -> None:
+        item = self.sample_table.itemAt(pos)
+        if item is None:
+            return
+        row = item.row()
+        if row >= len(self.samples):
+            return
+        rows = self._selected_sample_rows()
+        if row not in rows:
+            self.sample_table.clearSelection()
+            self.sample_table.setCurrentCell(row, getattr(self, "sample_file_col", 1))
+            self.sample_table.selectRow(row)
+            rows = [row]
+        if not rows:
+            return
+        menu = self._build_sample_context_menu(rows)
+        menu.exec_(self.sample_table.viewport().mapToGlobal(pos))
+
+    def _remove_sample_rows(self, rows) -> None:
+        if self._project_operation_blocked_by_calculation():
+            return
+        rows = sorted({int(row) for row in rows if 0 <= int(row) < len(self.samples)})
+        if not rows:
+            return
+        old_active = self.active_sample_index
+        removed = set(rows)
+        for row in rows:
+            sample_id = self.samples[row].sample_id
+            self._discard_prepared_project_snapshot(sample_id)
+            self._sample_status_tasks.pop(str(sample_id), None)
+        self.samples = [sample for index, sample in enumerate(self.samples) if index not in removed]
+
+        if not self.samples:
+            target_index = -1
+        elif old_active in removed:
+            target_index = min(rows[0], len(self.samples) - 1)
+        else:
+            target_index = old_active - sum(row < old_active for row in rows)
+
+        self.active_sample_index = -1
+        self.data_loaded = False
+        self.results_ready = False
+        self._fit_cache = None
+        self.refresh_sample_table()
+        if target_index >= 0:
+            self.select_sample(target_index)
+        else:
+            self.fit_quality_history = []
+            self.current_rfit_percent = None
+            self.clear_result_table()
+            self._clear_plot(self.preview_plot, title="完整数据预览")
+            self._clear_plot(self.fit_plot, title="拟合范围预览")
+            self._clear_plot(self.size_plot, title="粒径分布 (计算后显示)")
+            self._update_fit_quality_display()
+            self._update_window_title()
+        self.statusBar().showMessage(f"已从列表移除 {len(rows)} 个样品", 3000)
 
     def ui(self, fn, *args, **kwargs):
         """线程安全地调度 UI 操作到 Qt 主线程。"""
@@ -605,7 +1717,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         index = getattr(self, "active_sample_index", -1)
         samples = getattr(self, "samples", [])
         if 0 <= index < len(samples):
-            return self._path_key(samples[index].path)
+            sample = samples[index]
+            return str(sample.sample_id or sample.data_fingerprint or self._path_key(sample.path))
         return ""
 
     @staticmethod
@@ -729,6 +1842,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
 
     def _on_alpha_value_changed(self, _value: float) -> None:
         self._alpha_fast_revision += 1
+        self._save_current_parameter_state()
         if getattr(self, "_fit_worker_running", False):
             return
         if not getattr(self, "results_ready", False):
@@ -898,12 +2012,11 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         return {"angle_min": round(float(angle_min), 2), "angle_max": round(float(angle_max), 2)}
 
     def load_file(self):
-        """Open BET-style import dialog and load selected XRD files."""
-        existing = [sample.path for sample in self.samples]
+        """Open the unified TXT/RAW/project import dialog."""
         dialog = XRDFileImportDialog(
             self,
             initial_dir=self.import_directory,
-            existing_paths=existing,
+            existing_paths=None,
             available_sort=self._import_available_sort,
         )
         if dialog.exec_() != XRDFileImportDialog.Accepted:
@@ -916,7 +2029,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.import_directory = str(dialog.current_directory)
         self._import_available_sort = dialog.available_sort()
         self._write_import_directory_setting(self.import_directory)
-        self.sync_files(paths)
+        self.load_files(paths)
 
     @staticmethod
     def _path_key(path: str | Path) -> str:
@@ -925,116 +2038,148 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         except OSError:
             return str(path).lower()
 
-    def _load_sample_from_path(self, path: str | Path) -> XRDSample:
+    def _load_sample_from_path(
+        self,
+        path: str | Path,
+        *,
+        parameter_state: dict | None = None,
+        peak_states: list[dict] | None = None,
+        progress_callback=None,
+    ) -> XRDSample:
+        def progress(value: int, stage: str) -> None:
+            if progress_callback is not None:
+                progress_callback(value, stage)
+
+        progress(0, "打开数据文件")
+        progress(10, "解析 TXT/RAW 数据")
         x, y, name, meta = load_xrd_file(str(path))
-        meta["file_name"] = os.path.splitext(os.path.basename(str(path)))[0]
-        return XRDSample(
+        # Keep the complete disk filename, including .raw/.txt. The separate
+        # sample_name metadata continues to represent the name inside the scan.
+        meta["file_name"] = os.path.basename(str(path))
+        progress(38, "计算数据内容指纹")
+        fingerprint = data_sha256(x, y)
+        try:
+            progress(46, "校验源文件")
+            source_fingerprint = file_sha256(path)
+        except OSError:
+            source_fingerprint = ""
+
+        progress(92, "创建样品记录")
+        if parameter_state is None:
+            parameter_state = self._current_parameter_state()
+        if peak_states is None:
+            peak_states = self._default_peak_states()
+        sample = XRDSample(
             path=str(path),
             x_data=x,
             y_data=y,
             name=name,
             metadata=meta,
-            peak_states=self._default_peak_states(),
+            data_fingerprint=fingerprint,
+            file_fingerprint=source_fingerprint,
+            parameter_state=dict(parameter_state),
+            peak_states=[dict(item) for item in peak_states],
         )
+        progress(100, "数据读取完成")
+        return sample
+
+    def _sample_import_keys(self, sample: XRDSample) -> set[str]:
+        # The row represents the artifact the user explicitly imported.  A
+        # project keeps its original RAW/TXT path only as provenance; that
+        # embedded source path must not block importing the raw data as a new,
+        # uncalculated sample alongside one or more project variants.
+        imported_path = sample.project_path or sample.path
+        return {self._path_key(imported_path)} if imported_path else set()
 
     def sync_files(self, paths: list[str]) -> None:
-        """Make the sample list match the import dialog's selected files."""
-        self._save_current_peak_states()
-        self._save_current_analysis_state()
-        self._save_current_manual_baseline_state()
-        self._save_current_marker_label_state()
-        self._save_current_plot_view_state()
-
-        existing_by_key = {self._path_key(sample.path): sample for sample in self.samples}
-        active_sample = self.samples[self.active_sample_index] if 0 <= self.active_sample_index < len(self.samples) else None
-        new_samples: list[XRDSample] = []
-        seen_keys: set[str] = set()
-        errors = []
-
-        for path in paths:
-            key = self._path_key(path)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            existing = existing_by_key.get(key)
-            if existing is not None:
-                new_samples.append(existing)
-                continue
-            try:
-                new_samples.append(self._load_sample_from_path(path))
-            except Exception as exc:
-                errors.append(f"{Path(path).name}: {exc}")
-
-        if errors:
-            messagebox.showwarning("文件读取错误", "部分文件无法加载：\n" + "\n".join(errors[:8]))
-        if not new_samples:
-            return
-
-        target_index = new_samples.index(active_sample) if active_sample in new_samples else 0
-        self.samples = new_samples
-        self.active_sample_index = -1
-        self.data_loaded = False
-        self.results_ready = False
-        self._fit_cache = None
-        self.refresh_sample_table()
-        self.select_sample(target_index)
-        self.statusBar().showMessage(f"样品列表已同步：{len(new_samples)} 个 XRD 文件", 4000)
+        """Backward-compatible alias: imports now append and deletion lives in the table menu."""
+        self.load_files(paths)
 
     def load_files(self, paths: list[str]):
-        """Append a batch of files into the sample table, used by drag-and-drop."""
-        existing = {str(Path(sample.path).resolve()).lower() for sample in self.samples}
-        loaded = 0
-        errors = []
+        """Queue TXT, RAW, or project files for responsive background loading."""
+        if self._project_operation_blocked_by_calculation():
+            return
+        existing = set().union(*(self._sample_import_keys(sample) for sample in self.samples)) if self.samples else set()
+        existing.update(self._file_load_jobs)
+        queued = 0
         for path in paths:
-            key = str(Path(path).resolve()).lower()
+            key = self._path_key(path)
             if key in existing:
                 continue
-            try:
-                self.samples.append(self._load_sample_from_path(path))
+            if self._start_file_load(path):
                 existing.add(key)
-                loaded += 1
-            except Exception as exc:
-                errors.append(f"{Path(path).name}: {exc}")
-
-        self.refresh_sample_table()
-        if self.samples and self.active_sample_index < 0:
-            self.select_sample(0)
-        elif loaded:
-            self.select_sample(len(self.samples) - loaded)
-        if loaded:
-            self.statusBar().showMessage(f"已导入 {loaded} 个 XRD 文件", 4000)
-
-        if errors:
-            messagebox.showwarning("文件读取错误", "部分文件无法加载：\n" + "\n".join(errors[:8]))
+                queued += 1
+        if queued > 1:
+            self.statusBar().showMessage(f"已加入后台读取队列：{queued} 个文件", 4000)
 
     def refresh_sample_table(self):
         compare_col = getattr(self, "sample_compare_col", 0)
         file_col = getattr(self, "sample_file_col", 1)
         status_col = getattr(self, "sample_status_col", 2)
         self.sample_table.blockSignals(True)
-        self.sample_table.setRowCount(len(self.samples))
+        self.sample_table.setRowCount(len(self.samples) + len(self._pending_file_loads))
         for row, sample in enumerate(self.samples):
             compare_item = QTableWidgetItem()
-            compare_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            compare_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
             compare_item.setCheckState(Qt.Checked if getattr(sample, "compare_visible", True) else Qt.Unchecked)
             compare_item.setTextAlignment(Qt.AlignCenter)
             compare_item.setToolTip("在对比分析中显示" if getattr(sample, "compare_visible", True) else "在对比分析中隐藏")
 
-            file_item = QTableWidgetItem(Path(sample.path).stem)
+            if sample.project_path:
+                display_file_name = Path(sample.project_path).name
+            elif sample.path:
+                display_file_name = Path(sample.path).name
+            else:
+                display_file_name = str(sample.name or "样品")
+            file_item = QTableWidgetItem(display_file_name)
             file_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             file_item.setForeground(QBrush(QColor("#111827")))
-            file_item.setToolTip(sample.path)
+            tooltip_lines = []
+            if sample.path:
+                tooltip_lines.append(f"数据文件：{sample.path}")
+            if sample.project_path:
+                tooltip_lines.append(f"工程文件：{sample.project_path}")
+            file_item.setToolTip("\n".join(tooltip_lines))
             status_item = QTableWidgetItem("")
             status_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             status_item.setIcon(self._status_icon(sample.status))
             status_item.setTextAlignment(Qt.AlignCenter)
-            status_item.setToolTip("计算完成" if sample.status == "complete" else "待计算")
+            task = self._sample_status_tasks.get(str(sample.sample_id))
+            if task is not None:
+                progress = max(0, min(100, int(task.get("progress", 0))))
+                operation = str(task.get("operation") or "处理中")
+                stage = str(task.get("stage") or operation)
+                status_item.setData(SAMPLE_STATUS_PROGRESS_ROLE, progress)
+                status_item.setToolTip(f"{operation}：{stage} · {progress}%")
+            else:
+                status_item.setToolTip(self._idle_sample_status_tooltip(sample))
             self.sample_table.setItem(row, compare_col, compare_item)
             self.sample_table.setItem(row, file_col, file_item)
             old_widget = self.sample_table.cellWidget(row, status_col)
             if old_widget is not None:
                 self.sample_table.removeCellWidget(row, status_col)
                 old_widget.deleteLater()
+            self.sample_table.setItem(row, status_col, status_item)
+        for offset, pending in enumerate(self._pending_file_loads.values()):
+            row = len(self.samples) + offset
+            compare_item = QTableWidgetItem()
+            compare_item.setFlags(Qt.ItemIsEnabled)
+
+            file_item = QTableWidgetItem(Path(pending["path"]).name)
+            file_item.setFlags(Qt.ItemIsEnabled)
+            file_item.setForeground(QBrush(QColor("#374151")))
+            file_item.setToolTip(str(pending["path"]))
+
+            progress = max(0, min(100, int(pending.get("progress", 0))))
+            stage = str(pending.get("stage") or "等待后台读取")
+            status_item = QTableWidgetItem("")
+            status_item.setFlags(Qt.ItemIsEnabled)
+            status_item.setTextAlignment(Qt.AlignCenter)
+            status_item.setData(SAMPLE_STATUS_PROGRESS_ROLE, progress)
+            status_item.setToolTip(f"{stage} · {progress}%")
+
+            self.sample_table.setItem(row, compare_col, compare_item)
+            self.sample_table.setItem(row, file_col, file_item)
             self.sample_table.setItem(row, status_col, status_item)
         self.sample_table.blockSignals(False)
         if 0 <= self.active_sample_index < len(self.samples):
@@ -1052,6 +2197,7 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             return
         self.samples[row].compare_visible = item.checkState() == Qt.Checked
         item.setToolTip("在对比分析中显示" if self.samples[row].compare_visible else "在对比分析中隐藏")
+        self._mark_project_dirty(self.samples[row])
         self._sync_compare_select_all_state()
         self._update_comparison_plots_if_available()
 
@@ -1062,10 +2208,12 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             return
         checked = state == Qt.Checked
         for sample in self.samples:
-            sample.compare_visible = checked
+            if sample.compare_visible != checked:
+                sample.compare_visible = checked
+                self._mark_project_dirty(sample)
         compare_col = getattr(self, "sample_compare_col", 0)
         self.sample_table.blockSignals(True)
-        for row in range(self.sample_table.rowCount()):
+        for row in range(len(self.samples)):
             item = self.sample_table.item(row, compare_col)
             if item is not None:
                 item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
@@ -1251,9 +2399,12 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             return
         self._save_current_peak_states()
         self._save_current_analysis_state()
+        self._save_current_parameter_state()
         self._save_current_manual_baseline_state()
         self._save_current_marker_label_state()
         self._save_current_plot_view_state()
+        self._save_current_size_visibility_state()
+        self._save_current_size_total_inclusion_state()
         self.active_sample_index = index
         sample = self.samples[index]
         self.x_data = sample.x_data
@@ -1261,39 +2412,74 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.data_loaded = True
         self.current_file_name = sample.name
         self.current_metadata = sample.metadata
-        had_analysis_state = bool(sample.analysis_state)
-        self._refresh_angle_control_bounds()
-        if sample.peak_states is None:
-            sample.peak_states = self._default_peak_states()
-        if sample.analysis_state:
-            self._apply_analysis_state(sample.analysis_state)
-        elif sample.results and "x_segment" in sample.results:
-            x_segment = np.asarray(sample.results["x_segment"], dtype=float)
-            if x_segment.size:
-                self._apply_analysis_state(
-                    {"angle_min": float(np.nanmin(x_segment)), "angle_max": float(np.nanmax(x_segment))}
-                )
-        else:
-            self._apply_analysis_state(self._default_analysis_state_for_current_data())
-        self._apply_peak_states(sample.peak_states)
-        self._apply_manual_baseline_state(sample.baseline_state)
-        self._apply_marker_label_state(sample.marker_label_state)
-        self._apply_plot_view_state(sample.plot_view_state)
+        self._restoring_sample_state = True
+        try:
+            if not sample.parameter_state:
+                sample.parameter_state = self._current_parameter_state()
+            self._apply_parameter_state(sample.parameter_state)
+            had_analysis_state = bool(sample.analysis_state)
+            self._refresh_angle_control_bounds()
+            if sample.peak_states is None:
+                sample.peak_states = self._default_peak_states()
+            if sample.analysis_state:
+                self._apply_analysis_state(sample.analysis_state)
+            elif sample.results and "x_segment" in sample.results:
+                x_segment = np.asarray(sample.results["x_segment"], dtype=float)
+                if x_segment.size:
+                    self._apply_analysis_state(
+                        {"angle_min": float(np.nanmin(x_segment)), "angle_max": float(np.nanmax(x_segment))}
+                    )
+            else:
+                self._apply_analysis_state(self._default_analysis_state_for_current_data())
+            self._apply_peak_states(sample.peak_states, refresh_preview=False)
+            self._apply_manual_baseline_state(sample.baseline_state, redraw=False)
+            self._apply_marker_label_state(sample.marker_label_state, apply_items=False)
+            self._apply_plot_view_state(sample.plot_view_state)
+            self._apply_size_visibility_state(sample.size_visibility_state)
+            self._apply_size_total_inclusion_state(sample.size_total_inclusion_state)
+        finally:
+            self._restoring_sample_state = False
         self.update_info_panel(sample.metadata)
         if sample.results:
             self._restore_sample_results(sample)
-            self.update_preview(None)
-            self.update_multi_peak_plots()
-            self._restore_sample_plot_view_state()
-            self.update_result_table()
         else:
             self.results_ready = False
             self._fit_cache = None
+            self.fit_quality_history = []
+            self.current_rfit_percent = None
+            if hasattr(self, "_update_fit_quality_display"):
+                self._update_fit_quality_display()
             self.clear_result_table()
             if not had_analysis_state:
                 self._set_default_import_range_and_peak()
-            self.update_preview(None)
         self._save_current_analysis_state()
+        self._update_window_title()
+        # Restarting a zero-delay timer coalesces rapid row clicks.  All state
+        # is already active, while expensive plot rebuilding happens once for
+        # only the final selected sample after Qt repaints the selection.
+        self._sample_render_timer.start(0)
+
+    def _render_selected_sample(self) -> None:
+        index = self.active_sample_index
+        if not (0 <= index < len(self.samples)):
+            return
+        sample = self.samples[index]
+        self._suspend_plot_updates = True
+        try:
+            self.update_preview(None)
+            if sample.results and self.results_ready:
+                self.update_multi_peak_plots()
+                self._restore_sample_plot_view_state()
+                self.update_result_table()
+        finally:
+            self._suspend_plot_updates = False
+        self._safe_draw_idle()
+        if (
+            hasattr(self, "right_tabs")
+            and hasattr(self, "compare_tab")
+            and self.right_tabs.currentWidget() is self.compare_tab
+        ):
+            self._update_comparison_plots_if_available()
 
     def _store_current_sample_results(self):
         if not (0 <= self.active_sample_index < len(self.samples)):
@@ -1301,9 +2487,15 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         sample = self.samples[self.active_sample_index]
         sample.status = "complete"
         sample.analysis_state = self._current_analysis_state()
+        sample.parameter_state = self._current_parameter_state()
         sample.baseline_state = self._current_manual_baseline_state()
-        sample.marker_label_state = self._current_marker_label_state()
+        self.marker_label_state = self._current_marker_label_state()
+        sample.marker_label_state = self.marker_label_state
         sample.plot_view_state = self._current_plot_view_state()
+        sample.size_visibility_state = dict(getattr(self, "_size_visibility", {}) or {})
+        sample.size_total_inclusion_state = dict(
+            getattr(self, "_size_total_inclusion", {}) or {}
+        )
         sample.results = {
             "best_f_total": self.best_f_total,
             "all_basis_k1": self.all_basis_k1,
@@ -1318,17 +2510,41 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             "y_segment_raw": self.y_segment_raw,
             "y_segment": self.y_segment,
             "background": self.background,
+            "fit_quality_history": list(getattr(self, "fit_quality_history", [])),
+            "current_rfit_percent": getattr(self, "current_rfit_percent", None),
             "_fit_cache": getattr(self, "_fit_cache", None),
         }
+        self.fit_curve_snapshot = None
+        if not sample.data_fingerprint:
+            sample.data_fingerprint = data_sha256(sample.x_data, sample.y_data)
+        sample.result_signature = self._result_signature_for_sample(sample)
+        sample.result_is_current = True
+        sample.runtime_plot_cache.clear()
+        # Build the one-dimensional display curves once in the calculation
+        # thread. Plotting and compact project serialization then reuse them.
+        try:
+            self._fit_curve_data_cache(self.result_active_peak_indices)
+        except Exception:
+            pass
+        self._mark_project_dirty()
+        self._queue_prepared_project_snapshot(sample)
         self.ui(self.refresh_sample_table)
         self.ui(self._update_comparison_plots_if_available)
 
     def _restore_sample_results(self, sample: XRDSample):
         self._fit_cache = sample.results.get("_fit_cache")
+        self.all_basis_k1 = list(sample.results.get("all_basis_k1") or [])
+        self.all_basis_k2 = list(sample.results.get("all_basis_k2") or [])
+        self.fit_curve_snapshot = sample.results.get("fit_curve_snapshot")
         for key, value in sample.results.items():
             setattr(self, key, value)
-        self._apply_marker_label_state(sample.marker_label_state)
-        self._apply_plot_view_state(sample.plot_view_state)
+        self.fit_quality_history = list(sample.results.get("fit_quality_history", []))
+        restored_rfit = sample.results.get("current_rfit_percent")
+        if restored_rfit is None:
+            restored_rfit = self._calculate_current_rfit_percent()
+        self.current_rfit_percent = restored_rfit
+        if hasattr(self, "_update_fit_quality_display"):
+            self._update_fit_quality_display()
         self.results_ready = True
 
     def _apply_fit_peak_positions(self, active_peak_indices, mu_values) -> None:
@@ -1416,10 +2632,25 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
             messagebox.showwarning("提示", "当前蓝色拟合范围内没有峰，请先在范围内添加或移动峰。")
             return
 
+        sample = self.samples[self.active_sample_index]
+        task_token = str(uuid.uuid4())
+        operation = "极速计算" if str(mode).lower() == "fast" else "精细计算"
+        params["task_sample_id"] = str(sample.sample_id)
+        params["task_token"] = task_token
+        self._fit_task_sample_id = str(sample.sample_id)
+        self._fit_task_token = task_token
+        self._fit_task_operation = operation
         self._alpha_fast_revision += 1
         self._alpha_fast_pending = False
         self._alpha_fast_timer.stop()
         self._fit_worker_running = True
+        self._set_sample_status_progress(
+            sample.sample_id,
+            0,
+            operation,
+            "准备计算",
+            task_token=task_token,
+        )
         self.stop_flag.clear()
         self.progress_label.show()
         self.progress_bar.show()
@@ -1430,10 +2661,17 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         for btn in (self.btn_fast, self.btn_fine):
             btn.setEnabled(False)
 
-        threading.Thread(target=self.compute_fit, args=(mode, params), daemon=True).start()
+        worker = threading.Thread(target=self.compute_fit, args=(mode, params), daemon=True)
+        worker.start()
+        # Peak placement is a transient editing mode. Exit it only after the
+        # calculation thread has actually started; validation failures above
+        # intentionally leave the mode active so the user can keep editing.
+        if getattr(self, "_peak_placement_mode", False):
+            self._set_peak_placement_mode(False)
 
     def compute_fit(self, mode: str = "fine", params: dict | None = None):
         """执行多峰拟合（子线程）。"""
+        calculation_succeeded = False
         try:
             params = params or {}
             source = params["source"]
@@ -1657,7 +2895,8 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 resid,
             )
 
-            self.process_multi_peak_results(self.result_active_peak_indices)
+            self.process_multi_peak_results(self.result_active_peak_indices, history_mode=mode)
+            calculation_succeeded = True
             self.ui_set(self.progress_var, "拟合成功！")
 
         except Exception as exc:
@@ -1671,6 +2910,15 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
                 except Exception:
                     pass
             self._fit_worker_running = False
+            task_sample_id = str((params or {}).get("task_sample_id") or "")
+            task_token = str((params or {}).get("task_token") or "")
+            if task_sample_id and task_token:
+                self.ui(
+                    self._finish_sample_calculation_status,
+                    task_sample_id,
+                    task_token,
+                    calculation_succeeded,
+                )
             for btn in (self.btn_fast, self.btn_fine):
                 self.ui(btn.setEnabled, True)
 
@@ -1679,7 +2927,44 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         self.stop_flag.set()
         self.ui_set(self.progress_var, "正在停止...")
 
-    def process_multi_peak_results(self, active_peak_indices=None):
+    def _calculate_current_rfit_percent(self) -> float | None:
+        """Calculate Rfit from the exact normalized net profile used by NNLS."""
+        cache = getattr(self, "_fit_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        basis_total = cache.get("basis_total")
+        y_scaled = cache.get("y_scaled")
+        f_total = getattr(self, "best_f_total", None)
+        if basis_total is None or y_scaled is None or f_total is None:
+            return None
+        try:
+            calculated = np.asarray(basis_total, dtype=float).dot(np.asarray(f_total, dtype=float))
+            value = calculate_rfit_percent(y_scaled, calculated)
+        except (TypeError, ValueError):
+            return None
+        return float(value) if np.isfinite(value) else None
+
+    def _record_fit_quality(self, mode: str) -> None:
+        value = self._calculate_current_rfit_percent()
+        self.current_rfit_percent = value
+        if value is None:
+            return
+
+        history = list(getattr(self, "fit_quality_history", []))
+        next_iteration = int(history[-1].get("iteration", len(history)) + 1) if history else 1
+        cache = getattr(self, "_fit_cache", {}) or {}
+        history.append(
+            {
+                "iteration": next_iteration,
+                "rfit_percent": float(value),
+                "mode": "fast" if str(mode).lower() == "fast" else "fine",
+                "peak_count": int(len(getattr(self, "result_active_peak_indices", []))),
+                "alpha": float(cache.get("alpha", 0.0)),
+            }
+        )
+        self.fit_quality_history = history
+
+    def process_multi_peak_results(self, active_peak_indices=None, *, history_mode: str | None = None):
         """调用 core/analysis 后处理 NNLS 结果，然后更新图表。"""
         active_peak_indices = list(active_peak_indices or self.active_peak_indices)
         self.all_peak_info, self.global_max_component_area = build_all_peak_info(
@@ -1692,8 +2977,14 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         )
         self.result_active_peak_indices = active_peak_indices
         self.results_ready = True
+        if history_mode is not None:
+            self._record_fit_quality(history_mode)
+        else:
+            self.current_rfit_percent = self._calculate_current_rfit_percent()
         self._store_current_sample_results()
         self.ui(self.progress_bar.setValue, 100)
+        if hasattr(self, "_update_fit_quality_display"):
+            self.ui(self._update_fit_quality_display)
         self.ui(self.update_multi_peak_plots)
         self.ui(self.update_result_table)
         self.ui_set(self.progress_var, "拟合成功！")
@@ -1846,7 +3137,48 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         except Exception as exc:
             messagebox.showwarning("保存失败", f"保存文件时出错: {exc}")
 
+    def _confirm_close_with_unsaved_samples(self) -> bool:
+        if self._project_save_jobs or self._file_load_jobs:
+            self.statusBar().showMessage("工程正在后台读取或保存，请完成后再关闭窗口", 4000)
+            QMessageBox.information(
+                self,
+                "工程读写进行中",
+                "工程正在后台读取或保存，请完成后再关闭窗口。",
+            )
+            return False
+        dirty_rows = [index for index, sample in enumerate(self.samples) if sample.project_dirty]
+        if not dirty_rows:
+            return True
+        if len(dirty_rows) == 1:
+            row = dirty_rows[0]
+            answer = QMessageBox.question(
+                self,
+                "样品工程尚未保存",
+                f"样品“{self.samples[row].name}”有尚未保存到工程文件的更改，是否现在保存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if answer == QMessageBox.Cancel:
+                return False
+            if answer == QMessageBox.Save:
+                self.save_project_file(sample_index=row)
+                return False
+            return True
+
+        answer = QMessageBox.warning(
+            self,
+            "多个样品尚未保存",
+            f"当前有 {len(dirty_rows)} 个样品尚未分别保存到工程文件。\n"
+            "如需保存，请取消关闭并在样品列表中逐个右键保存。",
+            QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        return answer == QMessageBox.Discard
+
     def closeEvent(self, event):
+        if not self._confirm_close_with_unsaved_samples():
+            event.ignore()
+            return
         self.stop_flag.set()
         if self._update_thread is not None and self._update_thread.isRunning():
             self._update_thread.quit()
@@ -1859,4 +3191,6 @@ class XRDApp(QMainWindow, ControlPanelMixin, PlotPanelMixin, LCurveMixin):
         if self._update_progress_dialog is not None:
             self._update_progress_dialog.close()
             self._update_progress_dialog = None
+        self._close_prepared_project_snapshots()
+        self._project_io_executor.shutdown(wait=False, cancel_futures=True)
         event.accept()

@@ -10,7 +10,7 @@ from typing import Iterable
 from PyQt5 import QtCore, QtWidgets
 
 
-SUPPORTED_SUFFIXES = {".txt", ".raw"}
+SUPPORTED_SUFFIXES = {".txt", ".raw", ".xrdproj"}
 
 
 class XRDFileImportDialog(QtWidgets.QDialog):
@@ -22,7 +22,7 @@ class XRDFileImportDialog(QtWidgets.QDialog):
         available_sort: tuple[int, QtCore.Qt.SortOrder] | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("导入数据文件")
+        self.setWindowTitle("导入数据或工程文件")
         self.resize(1060, 640)
         self.setMinimumSize(860, 520)
 

@@ -15,6 +15,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
+from pyqtgraph.graphicsItems.LegendItem import ItemSample
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -42,6 +43,11 @@ COMPONENT_COLORS = (
     "#7c3aed",
     "#14b8a6",
 )
+BASELINE_INTERACTION_TOOLTIP = "左键添加锚点，右键删除锚点"
+BASELINE_CURVE_HIT_WIDTH_PX = 8
+MARKER_LABEL_POSITION_MODE = "anchor-offset-v1"
+FIT_PEAK_LABEL_X_OFFSET_FRACTION = 0.006
+FIT_PEAK_LABEL_TOP_MARGIN_FRACTION = 0.018
 
 
 def _plain_number(value: float) -> str:
@@ -372,6 +378,77 @@ class _LegendToggleButton(QtWidgets.QToolButton):
             painter.drawLine(QtCore.QLineF(7, 18, 21, 6))
 
 
+class _SizeDistributionLegendSample(ItemSample):
+    """Legend swatch with separate Total-inclusion and visibility targets."""
+
+    CHECKBOX_HIT_WIDTH = 18.0
+
+    def __init__(self, item, *, inclusion_callback, visibility_callback) -> None:
+        super().__init__(item)
+        self._inclusion_callback = inclusion_callback
+        self._visibility_callback = visibility_callback
+        self._check_state = Qt.Checked
+        self.setFixedWidth(48)
+        self.setFixedHeight(20)
+        self.setToolTip(
+            "复选框：计入 Total 并显示/排除并隐藏；线条：已勾选时单独显示或隐藏"
+        )
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+
+    def boundingRect(self):
+        return QtCore.QRectF(0.0, 0.0, 48.0, 20.0)
+
+    def set_check_state(self, state) -> None:
+        state = Qt.CheckState(int(state))
+        if self._check_state == state:
+            return
+        self._check_state = state
+        self.update()
+
+    def check_state(self):
+        return self._check_state
+
+    def paint(self, painter, *_args) -> None:
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        checkbox = QtCore.QRectF(1.5, 3.5, 13.0, 13.0)
+        checked = self._check_state == Qt.Checked
+        partial = self._check_state == Qt.PartiallyChecked
+        painter.setPen(QtGui.QPen(QtGui.QColor("#2563eb" if checked or partial else "#64748b"), 1.2))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor("#2563eb" if checked or partial else "#ffffff")))
+        painter.drawRoundedRect(checkbox, 2.0, 2.0)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        if checked:
+            check_path = QtGui.QPainterPath()
+            check_path.moveTo(4.2, 10.0)
+            check_path.lineTo(7.0, 13.0)
+            check_path.lineTo(12.2, 6.7)
+            painter.drawPath(check_path)
+        elif partial:
+            painter.drawLine(QtCore.QLineF(4.5, 10.0, 11.5, 10.0))
+
+        opts = getattr(self.item, "opts", {})
+        line_pen = pg.mkPen(opts.get("pen", "#334155"))
+        if not self.item.isVisible():
+            color = QtGui.QColor(line_pen.color())
+            color.setAlpha(max(40, int(color.alpha() * 0.25)))
+            line_pen.setColor(color)
+        painter.setPen(line_pen)
+        painter.drawLine(QtCore.QLineF(23.0, 10.0, 47.0, 10.0))
+
+    def mouseClickEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        if float(event.pos().x()) <= self.CHECKBOX_HIT_WIDTH:
+            self._inclusion_callback()
+        else:
+            self._visibility_callback()
+        event.accept()
+        self.update()
+        self.sigClicked.emit(self.item)
+
+
 class _LegendToggleEventFilter(QtCore.QObject):
     def eventFilter(self, obj, event) -> bool:
         plot = self.parent()
@@ -382,6 +459,34 @@ class _LegendToggleEventFilter(QtCore.QObject):
             QtCore.QEvent.MouseButtonRelease,
         }:
             _position_legend_toggle_button(plot)
+        return False
+
+
+class _PeakPlacementLeaveFilter(QtCore.QObject):
+    """Hide the add-peak guide as soon as the pointer leaves a target plot."""
+
+    def __init__(self, owner, plot: pg.PlotWidget) -> None:
+        super().__init__(plot)
+        self.owner = owner
+        self.plot = plot
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in {QtCore.QEvent.Leave, QtCore.QEvent.Hide}:
+            self.owner._hide_peak_placement_guide(self.plot)
+        return False
+
+
+class _FitQualityOverlayEventFilter(QtCore.QObject):
+    """Keep the Rfit button and history card attached to the fit title."""
+
+    def __init__(self, owner, plot: pg.PlotWidget) -> None:
+        super().__init__(plot)
+        self.owner = owner
+        self.plot = plot
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in {QtCore.QEvent.Resize, QtCore.QEvent.Show}:
+            QtCore.QTimer.singleShot(0, self.owner._position_fit_quality_overlay)
         return False
 
 
@@ -834,6 +939,7 @@ class SampleCurveInteractionController(QtCore.QObject):
         label: str,
         x_values,
         y_values,
+        associated_items=None,
     ) -> None:
         x = np.asarray(x_values, dtype=float)
         y = np.asarray(y_values, dtype=float)
@@ -847,6 +953,7 @@ class SampleCurveInteractionController(QtCore.QObject):
             return
         x = x[mask]
         y = y[mask]
+        associated = [linked for linked in list(associated_items or []) if linked is not None]
         entry = {
             "item": item,
             "sample_index": int(sample_index),
@@ -858,6 +965,8 @@ class SampleCurveInteractionController(QtCore.QObject):
             "base_shadow_pen": _copy_pen_option(item.opts.get("shadowPen")),
             "base_symbol_size": item.opts.get("symbolSize"),
             "base_z": float(item.zValue()),
+            "associated_items": associated,
+            "associated_opacities": [float(linked.opacity()) for linked in associated],
         }
         self.entries.append(entry)
         try:
@@ -980,6 +1089,12 @@ class SampleCurveInteractionController(QtCore.QObject):
         entry: dict[str, object],
         transform_context,
     ) -> tuple[float, QtCore.QPointF | None]:
+        item = entry.get("item")
+        try:
+            if item is None or not item.isVisible():
+                return (math.inf, None)
+        except RuntimeError:
+            return (math.inf, None)
         x = np.asarray(entry["x"], dtype=float)
         y = np.asarray(entry["y"], dtype=float)
         x_view, y_view = self._data_to_view_coordinates(x, y)
@@ -1050,7 +1165,10 @@ class SampleCurveInteractionController(QtCore.QObject):
             if item is None:
                 continue
             try:
-                item.setOpacity(1.0 if int(other.get("sample_index", -1)) == sample_index else 0.22)
+                opacity = 1.0 if int(other.get("sample_index", -1)) == sample_index else 0.22
+                item.setOpacity(opacity)
+                for linked in other.get("associated_items", []):
+                    linked.setOpacity(opacity)
             except Exception:
                 pass
         for highlighted in self.entries:
@@ -1111,7 +1229,10 @@ class SampleCurveInteractionController(QtCore.QObject):
             if item is None:
                 continue
             try:
-                item.setOpacity(1.0 if int(other.get("sample_index", -1)) == sample_index else 0.22)
+                opacity = 1.0 if int(other.get("sample_index", -1)) == sample_index else 0.22
+                item.setOpacity(opacity)
+                for linked in other.get("associated_items", []):
+                    linked.setOpacity(opacity)
             except Exception:
                 pass
         for highlighted in self.entries:
@@ -1213,6 +1334,11 @@ class SampleCurveInteractionController(QtCore.QObject):
                 if entry.get("base_symbol_size") is not None:
                     item.setSymbolSize(entry["base_symbol_size"])
                 item.setZValue(float(entry.get("base_z", 0.0)))
+                for linked, opacity in zip(
+                    entry.get("associated_items", []),
+                    entry.get("associated_opacities", []),
+                ):
+                    linked.setOpacity(float(opacity))
             except Exception:
                 pass
 
@@ -1325,6 +1451,7 @@ def _register_sample_curve(
     label: str,
     x_values,
     y_values,
+    associated_items=None,
 ) -> None:
     if item is None:
         return
@@ -1334,6 +1461,7 @@ def _register_sample_curve(
         label=label,
         x_values=x_values,
         y_values=y_values,
+        associated_items=associated_items,
     )
 
 
@@ -1431,6 +1559,7 @@ class BaselineAnchorItem(pg.TargetItem):
         self._xrd_kind = kind
         self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
         self.setCursor(Qt.ArrowCursor)
+        self.setToolTip(BASELINE_INTERACTION_TOOLTIP)
         self.setZValue(2500)
 
     def mouseClickEvent(self, ev):
@@ -1442,6 +1571,83 @@ class BaselineAnchorItem(pg.TargetItem):
             )
             return
         super().mouseClickEvent(ev)
+
+
+class BaselineCurveItem(pg.PlotCurveItem):
+    """Baseline curve with glow, click-to-anchor, and drag-to-anchor behavior."""
+
+    def __init__(self, owner, x_values, y_values, *, editing: bool):
+        self._xrd_owner = owner
+        self._xrd_editing = bool(editing)
+        super().__init__(
+            x=np.asarray(x_values, dtype=float),
+            y=np.asarray(y_values, dtype=float),
+            pen=self._base_pen(),
+            clickable=True,
+        )
+        self.setClickable(True, width=BASELINE_CURVE_HIT_WIDTH_PX)
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        self.setToolTip(BASELINE_INTERACTION_TOOLTIP)
+        self.setCursor(Qt.ArrowCursor)
+
+    def _interaction_allowed(self) -> bool:
+        return bool(
+            getattr(self._xrd_owner, "data_loaded", False)
+            and not getattr(self._xrd_owner, "_peak_placement_mode", False)
+        )
+
+    def _base_pen(self):
+        return self._xrd_owner._curve_pen(
+            "#2563eb" if self._xrd_editing else "#94a3b8",
+            width=2.3 if self._xrd_editing else 1.25,
+            style=Qt.SolidLine if self._xrd_editing else Qt.DashLine,
+            alpha=0.98 if self._xrd_editing else 0.72,
+        )
+
+    def set_editing(self, editing: bool) -> None:
+        self._xrd_editing = bool(editing)
+        self.setPen(self._base_pen())
+        self.setShadowPen(None)
+        self.setCursor(Qt.ArrowCursor)
+
+    def hoverEvent(self, event) -> None:
+        allowed = self._interaction_allowed()
+        if event.isExit() or not allowed:
+            self.setPen(self._base_pen())
+            self.setShadowPen(None)
+            self.setCursor(Qt.ArrowCursor)
+            return
+        self.setPen(self._xrd_owner._curve_pen("#60a5fa", width=3.4, alpha=1.0))
+        self.setShadowPen(self._xrd_owner._curve_pen("#bfdbfe", width=7.0, alpha=0.72))
+        self.setCursor(Qt.ArrowCursor)
+        try:
+            event.acceptDrags(Qt.LeftButton)
+        except Exception:
+            pass
+
+    def mouseClickEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.LeftButton and self._interaction_allowed():
+                if self._xrd_owner._add_manual_baseline_anchor_from_curve(self, event):
+                    event.accept()
+                    return
+        except Exception:
+            pass
+        event.ignore()
+
+    def mouseDragEvent(self, event) -> None:
+        try:
+            if event.button() != Qt.LeftButton or not self._interaction_allowed():
+                event.ignore()
+                return
+            if self._xrd_owner._drag_manual_baseline_from_curve(self, event):
+                self.setCursor(Qt.ArrowCursor)
+                event.accept()
+                return
+        except Exception:
+            pass
+        event.ignore()
 
 
 class DraggableMarkerTextItem(pg.TextItem):
@@ -1456,6 +1662,7 @@ class DraggableMarkerTextItem(pg.TextItem):
         anchor_pos: tuple[float, float],
         *,
         marker_key: str,
+        component_center: float | None = None,
         fill=None,
     ):
         super().__init__(text=text, color=color, anchor=(0.5, 1.0), fill=fill)
@@ -1464,6 +1671,10 @@ class DraggableMarkerTextItem(pg.TextItem):
         self._xrd_color = color
         self._xrd_marker_key = str(marker_key)
         self._xrd_anchor_pos = (float(anchor_pos[0]), float(anchor_pos[1]))
+        self._xrd_component_center = (
+            float(component_center) if component_center is not None else None
+        )
+        self._xrd_default_pos = self._xrd_anchor_pos
         self._xrd_drag_offset = QtCore.QPointF(0.0, 0.0)
         self._xrd_connector_active = False
         self._xrd_connector = pg.PlotDataItem(
@@ -1533,6 +1744,11 @@ class PlotPanelMixin:
     """Right-side plot panel methods."""
 
     def setup_plots(self):
+        self._peak_placement_mode = False
+        self._peak_placement_guides = {}
+        self._peak_placement_leave_filters = []
+        self._peak_placement_last_plot = None
+        self._peak_placement_x = None
         self.progress_label_widget = QLabel("")
         self.progress_var = TextValue(self.progress_label_widget)
         self.progress_label = self.progress_label_widget
@@ -1559,6 +1775,8 @@ class PlotPanelMixin:
             }
             """
         )
+        if hasattr(self, "_on_fit_progress_value_changed"):
+            self.progress_bar.valueChanged.connect(self._on_fit_progress_value_changed)
         self.progress_label.hide()
         self.progress_bar.hide()
 
@@ -1617,6 +1835,9 @@ class PlotPanelMixin:
         self.preview_ax = self.preview_plot
         self.preview_canvas = self.preview_plot
         self.preview_plot.getPlotItem().getViewBox().setMouseEnabled(x=False, y=False)
+        self.preview_plot._click_projection_cursor_disabled = lambda: bool(
+            getattr(self, "_peak_placement_mode", False)
+        )
         self.preview_plot.scene().sigMouseClicked.connect(self._on_preview_plot_mouse_clicked)
         preview_layout.addWidget(self.preview_plot, 1)
 
@@ -1635,15 +1856,19 @@ class PlotPanelMixin:
         self.size_plot = self._make_plot("粒径分布 (计算后显示)", "Volume Density (体积分布)", "Particle size (nm)")
         self.size_distribution_mode = "volume"
         self.fit_plot._click_projection_cursor_disabled = lambda: bool(
-            getattr(self, "manual_baseline_enabled", False)
+            getattr(self, "manual_baseline_editing", False)
+            or getattr(self, "_peak_placement_mode", False)
         )
         self.fit_plot.setMinimumHeight(80)
         self.size_plot.setMinimumHeight(80)
+        self._setup_fit_quality_overlay()
         setattr(self.size_plot, "_legend_default_position", "right")
         self.axes0 = self.fit_plot
         self.axes1 = self.size_plot
+        link_sample_curve_hover_plots(self.fit_plot, self.size_plot)
         self._install_fit_view_all_handler()
         self.fit_plot.scene().sigMouseClicked.connect(self._on_fit_plot_mouse_clicked)
+        self._install_peak_placement_interactions()
         self.bottom_plot_splitter = _configure_splitter(QtWidgets.QSplitter(Qt.Horizontal), handle_width=7)
         self.bottom_plot_splitter.setMinimumHeight(110)
         self.bottom_plot_splitter.addWidget(self.fit_plot)
@@ -1685,10 +1910,19 @@ class PlotPanelMixin:
         self._manual_baseline_curve_item = None
         self._manual_baseline_anchor_items = []
         self._syncing_manual_baseline_anchor = False
+        self._manual_baseline_drag_anchor = None
+        self._manual_baseline_drag_anchor_id = None
         self.marker_text_visible = True
         self.fit_marker_text_items = []
         self._fit_marker_text_legend = None
         self._size_visibility = {}
+        self._size_total_inclusion = {}
+        self._fit_component_links = {}
+        self._fit_component_key_by_interaction_index = {}
+        self._fit_component_locked_key = None
+        self._fit_component_hover_key = None
+        self._fit_component_effective_key = None
+        self._fit_peak_labels = {}
 
     def _apply_initial_preview_height(self) -> None:
         if getattr(self, "_initial_preview_height_applied", False):
@@ -1746,6 +1980,172 @@ class PlotPanelMixin:
         _enable_click_projection_cursor(plot)
         return plot
 
+    def _setup_fit_quality_overlay(self) -> None:
+        """Create the clickable Rfit readout and its compact history chart."""
+        self.fit_quality_button = QtWidgets.QToolButton(self.fit_plot)
+        self.fit_quality_button.setObjectName("fitQualityButton")
+        self.fit_quality_button.setCheckable(True)
+        self.fit_quality_button.setCursor(Qt.PointingHandCursor)
+        self.fit_quality_button.setText("Rfit = --")
+        self.fit_quality_button.setToolTip(
+            "Rfit：背景扣除后净强度的相对均方根残差；数值越低，轮廓拟合越接近。\n"
+            "点击显示/隐藏计算历史（蓝色圆点：极速计算；绿色菱形：精细计算）。"
+        )
+        self.fit_quality_button.setStyleSheet(
+            """
+            QToolButton#fitQualityButton {
+                min-width: 92px;
+                min-height: 21px;
+                padding: 0 7px;
+                color: #1d4ed8;
+                background: rgba(255, 255, 255, 235);
+                border: 1px solid #93c5fd;
+                border-radius: 4px;
+                font: 8pt 'Microsoft YaHei UI';
+            }
+            QToolButton#fitQualityButton:hover { background: #eff6ff; }
+            QToolButton#fitQualityButton:checked {
+                color: #ffffff;
+                background: #2563eb;
+                border-color: #1d4ed8;
+            }
+            QToolButton#fitQualityButton:disabled {
+                color: #94a3b8;
+                background: rgba(248, 250, 252, 220);
+                border-color: #cbd5e1;
+            }
+            """
+        )
+
+        self.fit_quality_history_frame = QtWidgets.QFrame(self.fit_plot)
+        self.fit_quality_history_frame.setObjectName("fitQualityHistoryFrame")
+        self.fit_quality_history_frame.setStyleSheet(
+            "QFrame#fitQualityHistoryFrame { background: white; border: 1px solid #93c5fd; border-radius: 5px; }"
+        )
+        history_layout = QtWidgets.QVBoxLayout(self.fit_quality_history_frame)
+        history_layout.setContentsMargins(5, 4, 5, 4)
+        history_layout.setSpacing(0)
+        self.fit_quality_history_plot = pg.PlotWidget(
+            self.fit_quality_history_frame,
+            axisItems={
+                "bottom": PlainNumberAxis(orientation="bottom"),
+                "left": PlainNumberAxis(orientation="left"),
+            },
+        )
+        self.fit_quality_history_plot.setBackground("w")
+        self.fit_quality_history_plot.setMenuEnabled(False)
+        self.fit_quality_history_plot.hideButtons()
+        self.fit_quality_history_plot.showGrid(x=True, y=True, alpha=0.18)
+        self.fit_quality_history_plot.setMouseEnabled(x=False, y=False)
+        self.fit_quality_history_plot.setLabel("left", "Rfit (%)", color="#475569", size="8pt")
+        self.fit_quality_history_plot.setLabel("bottom", "计算次数", color="#475569", size="8pt")
+        self.fit_quality_history_plot.setTitle(
+            "计算历史　<span style='color:#2563eb'>● 极速</span>　"
+            "<span style='color:#16a34a'>◆ 精细</span>",
+            color="#334155",
+            size="8pt",
+        )
+        history_layout.addWidget(self.fit_quality_history_plot)
+        self.fit_quality_history_frame.hide()
+
+        self.fit_quality_button.toggled.connect(self._toggle_fit_quality_history)
+        self._fit_quality_overlay_event_filter = _FitQualityOverlayEventFilter(self, self.fit_plot)
+        self.fit_plot.installEventFilter(self._fit_quality_overlay_event_filter)
+        viewport = getattr(self.fit_plot, "viewport", lambda: None)()
+        if viewport is not None:
+            viewport.installEventFilter(self._fit_quality_overlay_event_filter)
+        self._update_fit_quality_display()
+
+    def _toggle_fit_quality_history(self, visible: bool) -> None:
+        has_history = bool(getattr(self, "fit_quality_history", []))
+        self.fit_quality_history_frame.setVisible(bool(visible and has_history))
+        self.fit_quality_button.setToolTip(
+            "Rfit：背景扣除后净强度的相对均方根残差；数值越低，轮廓拟合越接近。\n"
+            + ("点击隐藏计算历史。" if visible else "点击显示计算历史。")
+            + "\n蓝色圆点：极速计算；绿色菱形：精细计算。增删峰后历史继续，但不同模型的数值不宜严格横向比较。"
+        )
+        self._position_fit_quality_overlay()
+
+    def _position_fit_quality_overlay(self) -> None:
+        button = getattr(self, "fit_quality_button", None)
+        frame = getattr(self, "fit_quality_history_frame", None)
+        plot = getattr(self, "fit_plot", None)
+        if button is None or frame is None or plot is None:
+            return
+
+        button.adjustSize()
+        button_width = max(100, button.sizeHint().width())
+        button.setFixedWidth(button_width)
+        # Keep the readout in this plot's top-right corner, on the title row.
+        # Leave room for the existing 24 px legend-eye button at the far right.
+        legend_button = getattr(plot, "_legend_toggle_button", None)
+        right_reserve = (legend_button.width() + 10) if legend_button is not None else 7
+        button_x = max(7, plot.width() - button_width - right_reserve)
+        button.move(button_x, 3)
+
+        available_width = max(180, plot.width() - 12)
+        frame_width = min(320, available_width)
+        frame_top = button.y() + button.height() + 4
+        available_height = max(84, plot.height() - frame_top - 7)
+        frame_height = min(190, available_height)
+        frame.resize(frame_width, frame_height)
+        frame_x = min(
+            plot.width() - frame_width - 6,
+            max(6, button.x() + button.width() - frame_width),
+        )
+        frame.move(max(6, frame_x), frame_top)
+        frame.raise_()
+        button.raise_()
+
+    def _render_fit_quality_history(self) -> None:
+        chart = getattr(self, "fit_quality_history_plot", None)
+        if chart is None:
+            return
+        chart.clear()
+        history = [
+            item for item in list(getattr(self, "fit_quality_history", []))
+            if np.isfinite(float(item.get("rfit_percent", np.nan)))
+        ]
+        if not history:
+            return
+
+        x_values = np.asarray([int(item.get("iteration", i + 1)) for i, item in enumerate(history)], dtype=float)
+        y_values = np.asarray([float(item["rfit_percent"]) for item in history], dtype=float)
+        chart.plot(x_values, y_values, pen=pg.mkPen("#64748b", width=1.5))
+
+        for mode, color, symbol in (("fast", "#2563eb", "o"), ("fine", "#16a34a", "d")):
+            mask = np.asarray([str(item.get("mode", "fine")) == mode for item in history], dtype=bool)
+            if np.any(mask):
+                chart.plot(
+                    x_values[mask],
+                    y_values[mask],
+                    pen=None,
+                    symbol=symbol,
+                    symbolSize=7,
+                    symbolPen=pg.mkPen(color, width=1),
+                    symbolBrush=pg.mkBrush(color),
+                )
+
+        x_padding = max(0.4, (float(x_values[-1]) - float(x_values[0])) * 0.04)
+        chart.setXRange(float(x_values[0]) - x_padding, float(x_values[-1]) + x_padding, padding=0)
+        y_min = float(np.min(y_values))
+        y_max = float(np.max(y_values))
+        y_padding = max(0.02, (y_max - y_min) * 0.12, abs(y_max) * 0.03)
+        chart.setYRange(max(0.0, y_min - y_padding), y_max + y_padding, padding=0)
+
+    def _update_fit_quality_display(self) -> None:
+        button = getattr(self, "fit_quality_button", None)
+        if button is None:
+            return
+        value = getattr(self, "current_rfit_percent", None)
+        valid = value is not None and np.isfinite(float(value))
+        button.setText(f"Rfit = {float(value):.2f}%" if valid else "Rfit = --")
+        button.setEnabled(bool(valid))
+        self._render_fit_quality_history()
+        if not valid:
+            button.setChecked(False)
+        self._position_fit_quality_overlay()
+
     def _set_size_distribution_mode(self, mode: str) -> None:
         mode = "number" if str(mode).lower() == "number" else "volume"
         if getattr(self, "size_distribution_mode", "volume") == mode:
@@ -1755,6 +2155,12 @@ class PlotPanelMixin:
             active_indices = list(getattr(self, "result_active_peak_indices", self.active_peak_indices))
             self._redraw_size_distribution_plot(active_indices)
             self._safe_draw_idle()
+        if (
+            hasattr(self, "right_tabs")
+            and hasattr(self, "compare_tab")
+            and self.right_tabs.currentWidget() is self.compare_tab
+        ):
+            self.update_comparison_plots()
 
     def _size_distribution_axis_label(self) -> str:
         if getattr(self, "size_distribution_mode", "volume") == "number":
@@ -1762,8 +2168,7 @@ class PlotPanelMixin:
         return "Volume Density (体积分布)"
 
     def _size_distribution_legend_label(self, peak_id: int | None = None) -> str:
-        suffix = "Number Size Distribution" if getattr(self, "size_distribution_mode", "volume") == "number" else "Particle Size Distribution"
-        return f"Peak{peak_id + 1} {suffix}" if peak_id is not None else f"Total {suffix}"
+        return f"Peak{peak_id + 1}" if peak_id is not None else "Total"
 
     @staticmethod
     def _distribution_weights(info: dict, D_range: np.ndarray, mode: str) -> np.ndarray:
@@ -1778,6 +2183,59 @@ class PlotPanelMixin:
             values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
             values = np.clip(values, 0.0, None)
         return values
+
+    @staticmethod
+    def _size_component_display_range(
+        D_range: np.ndarray,
+        y_values: np.ndarray,
+        indices: np.ndarray,
+        *,
+        left_boundary: float | None = None,
+        right_boundary: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return a visually continuous subrange without changing its weights.
+
+        ``peak_details.indices`` partitions the discrete size grid completely.
+        Adjacent groups nevertheless end at two different grid points, so two
+        separately drawn fills would leave the line segment between those
+        points unpainted. New results supply shared valley boundaries; older
+        saved results fall back to shared grid midpoints. The numerical
+        integration and percentages continue to use the original indices.
+        """
+        D = np.asarray(D_range, dtype=float)
+        y = np.asarray(y_values, dtype=float)
+        idx = np.unique(np.asarray(indices, dtype=int))
+        idx = idx[(idx >= 0) & (idx < D.size) & (idx < y.size)]
+        if idx.size == 0:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        range_x = D[idx].copy()
+        range_y = y[idx].copy()
+        first = int(idx[0])
+        last = int(idx[-1])
+        if left_boundary is not None and np.isfinite(float(left_boundary)):
+            boundary_x = float(np.clip(float(left_boundary), float(np.min(D)), float(np.max(D))))
+            if boundary_x < float(range_x[0]) and not np.isclose(boundary_x, range_x[0]):
+                boundary_y = float(np.interp(boundary_x, D, y))
+                range_x = np.insert(range_x, 0, boundary_x)
+                range_y = np.insert(range_y, 0, boundary_y)
+        elif first > 0:
+            boundary_x = 0.5 * (float(D[first - 1]) + float(D[first]))
+            boundary_y = float(np.interp(boundary_x, D, y))
+            range_x = np.insert(range_x, 0, boundary_x)
+            range_y = np.insert(range_y, 0, boundary_y)
+        if right_boundary is not None and np.isfinite(float(right_boundary)):
+            boundary_x = float(np.clip(float(right_boundary), float(np.min(D)), float(np.max(D))))
+            if boundary_x > float(range_x[-1]) and not np.isclose(boundary_x, range_x[-1]):
+                boundary_y = float(np.interp(boundary_x, D, y))
+                range_x = np.append(range_x, boundary_x)
+                range_y = np.append(range_y, boundary_y)
+        elif last + 1 < D.size:
+            boundary_x = 0.5 * (float(D[last]) + float(D[last + 1]))
+            boundary_y = float(np.interp(boundary_x, D, y))
+            range_x = np.append(range_x, boundary_x)
+            range_y = np.append(range_y, boundary_y)
+        return range_x, range_y
 
     def _sample_display_name(self, sample) -> str:
         try:
@@ -1803,6 +2261,40 @@ class PlotPanelMixin:
             "#7c3aed",
         )
         return colors[int(index) % len(colors)]
+
+    def _included_total_distribution(
+        self,
+        peak_infos,
+        D_range: np.ndarray,
+        active_peak_indices,
+        inclusion_state: dict | None,
+        *,
+        mode: str,
+    ) -> np.ndarray | None:
+        """Reproduce the single-sample Total curve from its included Peaks."""
+        D = np.asarray(D_range, dtype=float)
+        active = list(active_peak_indices or [])
+        inclusion = dict(inclusion_state or {})
+        peak_weights = []
+        peak_ids = []
+        for position, info in enumerate(list(peak_infos or [])):
+            raw_values = np.asarray(info.get("volume_dist", info.get("f_segment", [])), dtype=float)
+            if raw_values.size != D.size:
+                continue
+            values = self._distribution_weights(info, D, mode)
+            fallback_id = active[position] if position < len(active) else position
+            peak_ids.append(int(info.get("peak_id", fallback_id)))
+            peak_weights.append(values)
+        if not peak_weights:
+            return None
+
+        denominator = max(float(np.sum(peak_weights)), 1e-12)
+        included_total = np.zeros_like(D, dtype=float)
+        for peak_id, values in zip(peak_ids, peak_weights):
+            included = inclusion.get(peak_id, inclusion.get(str(peak_id), True))
+            if bool(included):
+                included_total += values
+        return included_total / denominator
 
     def set_sample_curve_hover_plots(self, sample_index: int | None, *plots: pg.PlotWidget) -> None:
         set_sample_curve_hover_plots(sample_index, *plots)
@@ -1839,6 +2331,9 @@ class PlotPanelMixin:
         size_legend_entries = []
         size_y_max = 0.0
         size_has_curve = False
+        comparison_mode = (
+            "number" if str(getattr(self, "size_distribution_mode", "volume")).lower() == "number" else "volume"
+        )
         for index, sample in visible_samples:
             color = self._comparison_color(index)
             label = self._sample_display_name(sample)
@@ -1861,17 +2356,23 @@ class PlotPanelMixin:
             D_range = np.asarray(results.get("D_range", []), dtype=float)
             peak_infos = list(results.get("all_peak_info", []) or [])
             if D_range.size and peak_infos:
-                eps = 1e-12
-                area_total = 0.0
-                f_segments = []
-                for info in peak_infos:
-                    f_segment = np.asarray(info.get("f_segment", []), dtype=float)
-                    if f_segment.size == D_range.size:
-                        f_segments.append(f_segment)
-                    area_total += sum(float(det.get("area", 0.0)) for det in info.get("peak_details", []))
-                if f_segments:
-                    y_pdf = np.sum(f_segments, axis=0) / max(area_total, eps)
+                y_pdf = self._included_total_distribution(
+                    peak_infos,
+                    D_range,
+                    results.get("result_active_peak_indices", []),
+                    getattr(sample, "size_total_inclusion_state", {}),
+                    mode=comparison_mode,
+                )
+                if y_pdf is not None:
                     item = self._line(self.compare_size_plot, D_range, y_pdf, color, width=2.0, alpha=0.9, name=label)
+                    fill = self._add_fill(
+                        self.compare_size_plot,
+                        D_range,
+                        y_pdf,
+                        np.zeros_like(y_pdf),
+                        color,
+                        alpha=0.12,
+                    )
                     size_legend_entries.append((index, item, label))
                     _register_sample_curve(
                         self.compare_size_plot,
@@ -1880,6 +2381,7 @@ class PlotPanelMixin:
                         label=label,
                         x_values=D_range,
                         y_values=y_pdf,
+                        associated_items=list(fill.values()),
                     )
                     size_y_max = max(size_y_max, float(np.nanmax(y_pdf)) if y_pdf.size else 0.0)
                     size_has_curve = True
@@ -1927,7 +2429,10 @@ class PlotPanelMixin:
 
         self.compare_preview_plot.setLabel("left", "Intensity")
         self.compare_preview_plot.setLabel("bottom", "2θ (°)")
-        self.compare_size_plot.setLabel("left", "Volume Density (体积分布)")
+        self.compare_size_plot.setLabel(
+            "left",
+            "Number Density (数量分布)" if comparison_mode == "number" else "Volume Density (体积分布)",
+        )
         self.compare_size_plot.setLabel("bottom", "Particle size (nm)")
         hovered = getattr(self, "_hovered_sample_row", -1)
         self.set_sample_curve_hover_plots(
@@ -1946,6 +2451,8 @@ class PlotPanelMixin:
             self._clear_plot_coordinate_artifacts(plot)
         plot.clear()
         if plot is getattr(self, "fit_plot", None):
+            if hasattr(self, "_reset_fit_component_links"):
+                self._reset_fit_component_links()
             self._manual_baseline_curve_item = None
             self._manual_baseline_anchor_items = []
             self.fit_marker_text_items = []
@@ -1955,6 +2462,8 @@ class PlotPanelMixin:
             legend.clear()
         if title is not None:
             plot.setTitle(title, color="#111827", size="10pt")
+        if hasattr(self, "_restore_peak_placement_guide"):
+            self._restore_peak_placement_guide(plot)
 
     def _ensure_plot_legend(self, plot: pg.PlotWidget):
         legend = getattr(plot.getPlotItem(), "legend", None)
@@ -2041,7 +2550,23 @@ class PlotPanelMixin:
             self._add_peak_legend_toggle(plot, int(peak_idx))
 
     def _size_component_visible(self, component_id: int | str) -> bool:
-        return bool(getattr(self, "_size_visibility", {}).get(component_id, True))
+        visibility = getattr(self, "_size_visibility", {}) or {}
+        return bool(visibility.get(component_id, visibility.get(str(component_id), True)))
+
+    def _size_component_included(self, component_id: int | str) -> bool:
+        inclusion = getattr(self, "_size_total_inclusion", {}) or {}
+        return bool(inclusion.get(component_id, inclusion.get(str(component_id), True)))
+
+    def _size_total_master_check_state(self):
+        peak_ids = [key for key in getattr(self, "actual_components", {}) if key != "global"]
+        if not peak_ids:
+            return Qt.Checked
+        checked = [self._size_component_included(peak_id) for peak_id in peak_ids]
+        if all(checked):
+            return Qt.Checked
+        if any(checked):
+            return Qt.PartiallyChecked
+        return Qt.Unchecked
 
     def _update_size_legend_style(self, component_id: int | str) -> None:
         handle = getattr(self, "legend_handles", {}).get(component_id)
@@ -2051,18 +2576,31 @@ class PlotPanelMixin:
         label_text = str(handle.get("text", ""))
         sample = handle.get("sample")
         label = handle.get("label")
+        if isinstance(sample, _SizeDistributionLegendSample):
+            check_state = (
+                self._size_total_master_check_state()
+                if component_id == "global"
+                else Qt.Checked if self._size_component_included(component_id) else Qt.Unchecked
+            )
+            sample.set_check_state(check_state)
+            sample.update()
         try:
             label.setText(label_text, color="#111827" if visible else "#9ca3af", size="9pt")
         except Exception:
             pass
         try:
-            sample.setOpacity(1.0 if visible else 0.25)
             label.setOpacity(1.0 if visible else 0.55)
         except Exception:
             pass
 
-    def _bind_size_legend_toggle(self, component_id: int | str, label_text: str) -> None:
+    def _bind_size_legend_toggle(self, component_id: int | str, label_text: str, line) -> None:
         legend = self._ensure_plot_legend(self.size_plot)
+        legend_sample = _SizeDistributionLegendSample(
+            line,
+            inclusion_callback=lambda key=component_id: self._toggle_size_total_inclusion(key),
+            visibility_callback=lambda key=component_id: self._toggle_size_component_visibility_from_legend(key),
+        )
+        legend.addItem(legend_sample, label_text)
         try:
             sample, label = legend.items[-1]
         except Exception:
@@ -2072,7 +2610,11 @@ class PlotPanelMixin:
             "label": label,
             "text": str(label_text),
         }
-        for obj in (sample, label):
+        try:
+            label.setToolTip("点击文字或线条可显示/隐藏曲线")
+        except Exception:
+            pass
+        for obj in (label,):
             try:
                 obj.setCursor(Qt.PointingHandCursor)
                 obj.setAcceptedMouseButtons(Qt.LeftButton)
@@ -2087,7 +2629,7 @@ class PlotPanelMixin:
                         return
                 except Exception:
                     pass
-                self._set_size_component_visibility(key, not self._size_component_visible(key))
+                self._toggle_size_component_visibility_from_legend(key)
 
             try:
                 obj.mouseClickEvent = on_click
@@ -2105,35 +2647,279 @@ class PlotPanelMixin:
             self._size_visibility = {}
         self._size_visibility[component_id] = bool(visible)
         self._apply_size_component_visibility(component_id)
-        if component_id != "global":
-            self._update_visible_size_total()
+        self._save_current_size_visibility_state()
         self._safe_draw_idle()
 
-    def _update_visible_size_total(self) -> None:
+    def _toggle_size_component_visibility_from_legend(self, component_id: int | str) -> None:
+        # An excluded Peak stays hidden. Once checked, its curve may still be
+        # hidden independently without changing its contribution to Total.
+        if component_id != "global" and not self._size_component_included(component_id):
+            return
+        self._set_size_component_visibility(
+            component_id,
+            not self._size_component_visible(component_id),
+        )
+
+    def _toggle_size_total_inclusion(self, component_id: int | str) -> None:
+        if component_id == "global":
+            self._set_all_size_total_inclusion(
+                self._size_total_master_check_state() != Qt.Checked
+            )
+            return
+        self._set_size_total_inclusion(
+            component_id,
+            not self._size_component_included(component_id),
+        )
+
+    def _set_size_total_inclusion(self, component_id: int | str, included: bool) -> None:
+        if component_id == "global":
+            self._set_all_size_total_inclusion(included)
+            return
+        if not hasattr(self, "_size_total_inclusion"):
+            self._size_total_inclusion = {}
+        if not hasattr(self, "_size_visibility"):
+            self._size_visibility = {}
+        self._size_total_inclusion[component_id] = bool(included)
+        self._size_visibility[component_id] = bool(included)
+        self._apply_size_component_visibility(component_id)
+        self._update_included_size_total()
+        self._update_size_legend_style(component_id)
+        self._update_size_legend_style("global")
+        self._save_current_size_visibility_state()
+        self._save_current_size_total_inclusion_state()
+        self._safe_draw_idle()
+
+    def _set_all_size_total_inclusion(self, included: bool) -> None:
+        if not hasattr(self, "_size_total_inclusion"):
+            self._size_total_inclusion = {}
+        if not hasattr(self, "_size_visibility"):
+            self._size_visibility = {}
+        for component_id in getattr(self, "actual_components", {}):
+            if component_id != "global":
+                self._size_total_inclusion[component_id] = bool(included)
+                self._size_visibility[component_id] = bool(included)
+                self._apply_size_component_visibility(component_id)
+        self._update_included_size_total()
+        for component_id in getattr(self, "actual_components", {}):
+            self._update_size_legend_style(component_id)
+        self._save_current_size_visibility_state()
+        self._save_current_size_total_inclusion_state()
+        self._safe_draw_idle()
+
+    def _reset_fit_component_links(self) -> None:
+        self._fit_component_links = {}
+        self._fit_component_key_by_interaction_index = {}
+        self._fit_component_locked_key = None
+        self._fit_component_hover_key = None
+        self._fit_component_effective_key = None
+        self._fit_peak_labels = {}
+
+    @staticmethod
+    def _set_graphics_opacity(items, opacity: float) -> None:
+        if not isinstance(items, (list, tuple)):
+            items = [items]
+        for item in items:
+            if item is None:
+                continue
+            try:
+                item.setOpacity(max(0.0, min(1.0, float(opacity))))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _set_link_line_style(item, base_pen, base_z: float, *, focused: bool, dimmed: bool) -> None:
+        if item is None:
+            return
+        try:
+            if isinstance(base_pen, QtGui.QPen):
+                pen = QtGui.QPen(base_pen)
+                if focused:
+                    pen.setWidthF(max(3.6, float(base_pen.widthF()) + 2.0))
+                item.setPen(pen)
+            item.setOpacity(0.14 if dimmed else 1.0)
+            item.setZValue(120 if focused else float(base_z))
+            if hasattr(item, "setShadowPen"):
+                item.setShadowPen(None)
+        except Exception:
+            pass
+
+    def _on_fit_component_hover_index(self, interaction_index: int | None) -> None:
+        key = self._fit_component_key_by_interaction_index.get(interaction_index)
+        self._fit_component_hover_key = key
+        locked = self._fit_component_locked_key
+        if locked is not None:
+            link = self._fit_component_links.get(locked, {})
+            locked_index = link.get("interaction_index")
+            self._set_fit_component_controller_hover(locked_index)
+            self._apply_fit_component_focus(locked)
+            return
+        self._apply_fit_component_focus(key)
+
+    def _set_fit_component_controller_hover(self, interaction_index: int | None) -> None:
+        for plot in (getattr(self, "fit_plot", None), getattr(self, "size_plot", None)):
+            controller = getattr(plot, "_sample_curve_interaction_controller", None)
+            if controller is None:
+                continue
+            try:
+                if interaction_index is None:
+                    controller.clear_hover(propagate=False)
+                else:
+                    controller.set_hover_sample(int(interaction_index), propagate=False)
+            except Exception:
+                pass
+
+    def _on_fit_component_line_clicked(self, key: tuple[int, int], event) -> None:
+        try:
+            if event.button() != Qt.LeftButton:
+                return
+            double_click = getattr(event, "double", False)
+            is_double_click = double_click() if callable(double_click) else bool(double_click)
+            if is_double_click:
+                return
+            event.accept()
+        except Exception:
+            pass
+        cursor = getattr(self.fit_plot, "_click_projection_cursor", None)
+        if cursor is not None and hasattr(cursor, "clear"):
+            cursor.clear()
+        self._toggle_fit_component_lock(key)
+
+    def _toggle_fit_component_lock(self, key: tuple[int, int]) -> None:
+        if key not in self._fit_component_links:
+            return
+        if self._fit_component_locked_key == key:
+            self._fit_component_locked_key = None
+            self._set_fit_component_controller_hover(None)
+            self._fit_component_hover_key = None
+            self._apply_fit_component_focus(None, force=True)
+            return
+
+        self._fit_component_locked_key = key
+        link = self._fit_component_links[key]
+        interaction_index = link.get("interaction_index")
+        self._set_fit_component_controller_hover(interaction_index)
+        self._apply_fit_component_focus(key, force=True)
+
+    def _apply_fit_component_focus(self, key: tuple[int, int] | None, *, force: bool = False) -> None:
+        if not force and self._fit_component_effective_key == key:
+            return
+        self._fit_component_effective_key = key
+        focused_peak = key[0] if key is not None else None
+
+        for peak_id, label in getattr(self, "_fit_peak_labels", {}).items():
+            self._set_graphics_opacity(
+                label,
+                1.0 if key is None or int(peak_id) == int(focused_peak) else 0.16,
+            )
+
+        components = getattr(self, "actual_components", {}) or {}
+        for component_id, component in components.items():
+            if key is None:
+                self._set_graphics_opacity(component.get("items", []), 1.0)
+                continue
+            if component_id == "global":
+                self._set_graphics_opacity(component.get("line"), 0.24)
+                self._set_graphics_opacity(list(component.get("fill", {}).values()), 0.10)
+                continue
+            parent_focused = component_id == focused_peak
+            self._set_graphics_opacity(component.get("line"), 0.18 if parent_focused else 0.12)
+            self._set_graphics_opacity(
+                list(component.get("fill", {}).values()),
+                0.18 if parent_focused else 0.07,
+            )
+            self._set_graphics_opacity(
+                self.dist_texts.get(component_id, []),
+                0.42 if parent_focused else 0.10,
+            )
+
+        for link_key, link in self._fit_component_links.items():
+            selected = key is not None and link_key == key
+            dimmed = key is not None and not selected
+            self._set_link_line_style(
+                link.get("fit_line"),
+                link.get("fit_base_pen"),
+                float(link.get("fit_base_z", 15.0)),
+                focused=selected,
+                dimmed=dimmed,
+            )
+            self._set_graphics_opacity(
+                list(link.get("fit_fill", {}).values()),
+                1.0 if key is None or selected else 0.10,
+            )
+            self._set_graphics_opacity(
+                link.get("fit_label"),
+                1.0 if key is None or selected else 0.16,
+            )
+            self._set_link_line_style(
+                link.get("size_line"),
+                link.get("size_base_pen"),
+                float(link.get("size_base_z", 24.0)),
+                focused=selected,
+                dimmed=dimmed,
+            )
+            self._set_graphics_opacity(
+                list(link.get("size_fill", {}).values()),
+                1.0 if key is None or selected else 0.08,
+            )
+            self._set_graphics_opacity(
+                link.get("size_label"),
+                1.0 if key is None or selected else 0.12,
+            )
+        self._safe_draw_idle()
+
+    def _apply_size_visibility_state(self, state: dict | None) -> None:
+        self._size_visibility = dict(state or {})
+
+    def _apply_size_total_inclusion_state(self, state: dict | None) -> None:
+        self._size_total_inclusion = dict(state or {})
+
+    def _save_current_size_visibility_state(self) -> None:
+        index = getattr(self, "active_sample_index", -1)
+        samples = getattr(self, "samples", [])
+        if not (0 <= index < len(samples)):
+            return
+        state = dict(getattr(self, "_size_visibility", {}) or {})
+        if samples[index].size_visibility_state != state:
+            samples[index].size_visibility_state = state
+            if hasattr(self, "_mark_project_dirty"):
+                self._mark_project_dirty()
+
+    def _save_current_size_total_inclusion_state(self) -> None:
+        index = getattr(self, "active_sample_index", -1)
+        samples = getattr(self, "samples", [])
+        if not (0 <= index < len(samples)):
+            return
+        state = dict(getattr(self, "_size_total_inclusion", {}) or {})
+        if samples[index].size_total_inclusion_state != state:
+            samples[index].size_total_inclusion_state = state
+            if hasattr(self, "_mark_project_dirty"):
+                self._mark_project_dirty()
+
+    def _update_included_size_total(self) -> None:
         components = getattr(self, "actual_components", {})
         global_component = components.get("global", {})
         x_values = np.asarray(global_component.get("x", []), dtype=float)
         if x_values.size == 0:
             return
-        visible_total = np.zeros_like(x_values, dtype=float)
+        included_total = np.zeros_like(x_values, dtype=float)
         for component_id, component in components.items():
-            if component_id == "global" or not self._size_component_visible(component_id):
+            if component_id == "global" or not self._size_component_included(component_id):
                 continue
             values = np.asarray(component.get("y", []), dtype=float)
-            if values.size == visible_total.size:
-                visible_total += values
+            if values.size == included_total.size:
+                included_total += values
 
         line = global_component.get("line")
         fill = global_component.get("fill", {})
         if line is not None:
-            line.setData(x_values, visible_total)
+            line.setData(x_values, included_total)
         top_curve = fill.get("top")
         bottom_curve = fill.get("bottom")
         if top_curve is not None:
-            top_curve.setData(x_values, visible_total)
+            top_curve.setData(x_values, included_total)
         if bottom_curve is not None:
-            bottom_curve.setData(x_values, np.zeros_like(visible_total))
-        global_component["y"] = visible_total
+            bottom_curve.setData(x_values, np.zeros_like(included_total))
+        global_component["y"] = included_total
 
     def _set_fit_marker_text_visible(self, visible: bool) -> None:
         self.marker_text_visible = bool(visible)
@@ -2208,56 +2994,108 @@ class PlotPanelMixin:
         self._update_marker_text_legend_style()
 
     def _current_marker_label_state(self) -> dict:
-        positions = dict((getattr(self, "marker_label_state", {}) or {}).get("positions") or {})
+        # Only user-dragged component labels need persistent positions. Peak
+        # captions and untouched component labels are derived from the current
+        # curve and must be recalculated after every fit.
+        positions = {}
         for item in getattr(self, "fit_marker_text_items", []) or []:
+            if not isinstance(item, DraggableMarkerTextItem):
+                continue
+            if not bool(getattr(item, "_xrd_connector_active", False)):
+                continue
             key = getattr(item, "_xrd_marker_key", None)
             if not key:
                 continue
             try:
                 pos = item.pos()
+                anchor_x, anchor_y = item._xrd_anchor_pos
+                component_center = item._xrd_component_center
                 positions[str(key)] = {
-                    "x": float(pos.x()),
-                    "y": float(pos.y()),
-                    "connector": bool(getattr(item, "_xrd_connector_active", False)),
+                    "offset_x": float(pos.x()) - float(anchor_x),
+                    "offset_y": float(pos.y()) - float(anchor_y),
+                    "anchor_x": float(anchor_x),
+                    "component_center": (
+                        float(component_center) if component_center is not None else None
+                    ),
+                    "connector": True,
                 }
             except Exception:
                 pass
         return {
             "visible": bool(getattr(self, "marker_text_visible", True)),
+            "position_mode": MARKER_LABEL_POSITION_MODE,
             "positions": positions,
         }
 
-    def _apply_marker_label_state(self, state: dict | None) -> None:
+    def _apply_marker_label_state(
+        self,
+        state: dict | None,
+        *,
+        apply_items: bool = True,
+    ) -> None:
         state = dict(state or {})
+        position_mode = str(state.get("position_mode") or "")
+        # Older projects stored absolute positions for every label, including
+        # automatic Peak captions. Those coordinates cannot be associated
+        # safely after peaks are added/deleted or a fit is recalculated, so
+        # deliberately reset them to the current curve-derived positions.
+        positions = (
+            dict(state.get("positions") or {})
+            if position_mode == MARKER_LABEL_POSITION_MODE
+            else {}
+        )
         self.marker_label_state = {
             "visible": bool(state.get("visible", True)),
-            "positions": dict(state.get("positions") or {}),
+            "position_mode": MARKER_LABEL_POSITION_MODE,
+            "positions": positions,
         }
         self.marker_text_visible = bool(self.marker_label_state.get("visible", True))
-        self._apply_marker_label_state_to_items()
+        if apply_items:
+            self._apply_marker_label_state_to_items()
 
     def _save_current_marker_label_state(self) -> None:
+        previous = dict(getattr(self, "marker_label_state", {}) or {})
         self.marker_label_state = self._current_marker_label_state()
         index = getattr(self, "active_sample_index", -1)
         samples = getattr(self, "samples", [])
         if 0 <= index < len(samples):
             samples[index].marker_label_state = self.marker_label_state
+            if previous != self.marker_label_state and hasattr(self, "_mark_project_dirty"):
+                self._mark_project_dirty()
 
     def _apply_marker_label_state_to_items(self) -> None:
         state = getattr(self, "marker_label_state", {}) or {}
-        positions = dict(state.get("positions") or {})
+        positions = (
+            dict(state.get("positions") or {})
+            if state.get("position_mode") == MARKER_LABEL_POSITION_MODE
+            else {}
+        )
         self.marker_text_visible = bool(state.get("visible", getattr(self, "marker_text_visible", True)))
         for item in getattr(self, "fit_marker_text_items", []) or []:
             key = getattr(item, "_xrd_marker_key", None)
             saved = positions.get(str(key)) if key is not None else None
-            if saved:
+            if isinstance(item, DraggableMarkerTextItem):
                 try:
-                    item.setPos(float(saved["x"]), float(saved["y"]))
-                    if hasattr(item, "_xrd_connector_active"):
-                        item._xrd_connector_active = bool(saved.get("connector", True))
-                        item._update_connector()
+                    if saved and self._marker_label_layout_matches(item, saved):
+                        anchor_x, anchor_y = item._xrd_anchor_pos
+                        item.setPos(
+                            float(anchor_x) + float(saved["offset_x"]),
+                            float(anchor_y) + float(saved["offset_y"]),
+                        )
+                        item._xrd_connector_active = True
+                    else:
+                        item._xrd_connector_active = False
+                        default_x, default_y = item._xrd_default_pos
+                        item.setPos(float(default_x), float(default_y))
+                    item._update_connector()
                 except Exception:
-                    pass
+                    item._xrd_connector_active = False
+                    try:
+                        default_x, default_y = item._xrd_default_pos
+                        item.setPos(float(default_x), float(default_y))
+                    except Exception:
+                        pass
+                    item._update_connector()
             try:
                 if hasattr(item, "set_marker_visible"):
                     item.set_marker_visible(self.marker_text_visible)
@@ -2266,6 +3104,33 @@ class PlotPanelMixin:
             except Exception:
                 pass
         self._update_marker_text_legend_style()
+
+    @staticmethod
+    def _marker_label_layout_matches(item, saved: dict) -> bool:
+        """Reject a saved offset when its peak/component identity has changed."""
+        try:
+            offset_x = float(saved["offset_x"])
+            offset_y = float(saved["offset_y"])
+            saved_anchor_x = float(saved["anchor_x"])
+            current_anchor_x = float(item._xrd_anchor_pos[0])
+            saved_center = float(saved["component_center"])
+            current_center = float(item._xrd_component_center)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+        values = (
+            offset_x,
+            offset_y,
+            saved_anchor_x,
+            current_anchor_x,
+            saved_center,
+            current_center,
+        )
+        if not all(np.isfinite(value) for value in values):
+            return False
+        if abs(saved_anchor_x - current_anchor_x) > 0.25:
+            return False
+        center_tolerance = max(0.3, 0.05 * max(abs(saved_center), abs(current_center)))
+        return abs(saved_center - current_center) <= center_tolerance
 
     @staticmethod
     def _rgba(color: str, alpha: float) -> QtGui.QColor:
@@ -2279,10 +3144,56 @@ class PlotPanelMixin:
     def _curve_pen(color: str, width: float = 1.5, style=Qt.SolidLine, alpha: float = 1.0) -> QtGui.QPen:
         return pg.mkPen(PlotPanelMixin._rgba(color, alpha), width=width, style=style)
 
+    @staticmethod
+    def _display_scatter_data(x, y, max_points: int = 6000) -> tuple[np.ndarray, np.ndarray]:
+        """Return a peak-preserving display subset without changing fit data."""
+        x_values = np.asarray(x, dtype=float).reshape(-1)
+        y_values = np.asarray(y, dtype=float).reshape(-1)
+        size = min(x_values.size, y_values.size)
+        x_values = x_values[:size]
+        y_values = y_values[:size]
+        limit = max(4, int(max_points))
+        if size <= limit:
+            return x_values, y_values
+
+        # Keep both extrema from consecutive buckets.  Unlike a simple stride,
+        # this preserves narrow XRD peaks while bounding the number of symbol
+        # items that PyQtGraph must paint.
+        bucket_count = max(1, limit // 2)
+        step = max(1, int(np.ceil(size / bucket_count)))
+        full_size = (size // step) * step
+        selected_parts = [np.asarray([0, size - 1], dtype=int)]
+        if full_size:
+            blocks = y_values[:full_size].reshape(-1, step)
+            finite_blocks = np.isfinite(blocks)
+            minimum_values = np.where(finite_blocks, blocks, np.inf)
+            maximum_values = np.where(finite_blocks, blocks, -np.inf)
+            offsets = np.arange(blocks.shape[0], dtype=int) * step
+            selected_parts.extend(
+                (
+                    offsets + np.argmin(minimum_values, axis=1),
+                    offsets + np.argmax(maximum_values, axis=1),
+                )
+            )
+        if full_size < size:
+            tail = y_values[full_size:]
+            finite_tail = np.isfinite(tail)
+            selected_parts.extend(
+                (
+                    np.asarray([full_size + int(np.argmin(np.where(finite_tail, tail, np.inf)))]),
+                    np.asarray([full_size + int(np.argmax(np.where(finite_tail, tail, -np.inf)))]),
+                )
+            )
+        indices = np.unique(np.concatenate(selected_parts))
+        if indices.size > limit:
+            indices = indices[np.linspace(0, indices.size - 1, limit, dtype=int)]
+        return x_values[indices], y_values[indices]
+
     def _scatter(self, plot: pg.PlotWidget, x, y, color: str, *, alpha: float = 0.5, size: float = 4, name: str | None = None):
+        display_x, display_y = self._display_scatter_data(x, y)
         return plot.plot(
-            np.asarray(x, dtype=float),
-            np.asarray(y, dtype=float),
+            display_x,
+            display_y,
             pen=None,
             symbol="o",
             symbolSize=size,
@@ -2332,6 +3243,8 @@ class PlotPanelMixin:
         canvas.grab().save(path)
 
     def _safe_draw_idle(self):
+        if getattr(self, "_suspend_plot_updates", False):
+            return
         for widget in (
             getattr(self, "preview_plot", None),
             getattr(self, "fit_plot", None),
@@ -2344,6 +3257,252 @@ class PlotPanelMixin:
 
     def _safe_hide(self, artist):
         self._set_items_visible(artist, False)
+
+    def _install_peak_placement_interactions(self) -> None:
+        for plot in (self.preview_plot, self.fit_plot):
+            plot.scene().sigMouseMoved.connect(
+                lambda scene_pos, target=plot: self._on_peak_placement_mouse_moved(target, scene_pos)
+            )
+            event_filter = _PeakPlacementLeaveFilter(self, plot)
+            plot.installEventFilter(event_filter)
+            viewport = getattr(plot, "viewport", lambda: None)()
+            if viewport is not None:
+                viewport.installEventFilter(event_filter)
+            self._peak_placement_leave_filters.append(event_filter)
+            self._ensure_peak_placement_guide(plot)
+
+        self._peak_placement_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(Qt.Key_Escape), self)
+        self._peak_placement_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._peak_placement_shortcut.activated.connect(self._cancel_peak_placement_mode)
+
+    def _ensure_peak_placement_guide(self, plot: pg.PlotWidget):
+        guide = getattr(self, "_peak_placement_guides", {}).get(plot)
+        if guide is None:
+            guide = pg.InfiniteLine(
+                angle=90,
+                movable=False,
+                pen=self._curve_pen("#2563eb", width=1.8, style=Qt.DashLine, alpha=0.95),
+            )
+            guide.setZValue(9000)
+            try:
+                guide.setAcceptedMouseButtons(Qt.NoButton)
+            except Exception:
+                pass
+            self._peak_placement_guides[plot] = guide
+        view_box = plot.getPlotItem().getViewBox()
+        if guide not in getattr(view_box, "addedItems", []):
+            view_box.addItem(guide, ignoreBounds=True)
+        low, high = self._peak_placement_bounds(plot)
+        guide.setBounds((float(low), float(high)))
+        return guide
+
+    def _restore_peak_placement_guide(self, plot: pg.PlotWidget) -> None:
+        if plot not in (getattr(self, "preview_plot", None), getattr(self, "fit_plot", None)):
+            return
+        guide = self._ensure_peak_placement_guide(plot)
+        should_show = bool(
+            getattr(self, "_peak_placement_mode", False)
+            and getattr(self, "_peak_placement_last_plot", None) is plot
+            and getattr(self, "_peak_placement_x", None) is not None
+        )
+        if should_show:
+            guide.setValue(float(self._peak_placement_x))
+            guide.show()
+        else:
+            guide.hide()
+
+    def _hide_peak_placement_guide(self, plot: pg.PlotWidget) -> None:
+        guide = getattr(self, "_peak_placement_guides", {}).get(plot)
+        if guide is not None:
+            guide.hide()
+        if getattr(self, "_peak_placement_last_plot", None) is plot:
+            self._peak_placement_last_plot = None
+            self._peak_placement_x = None
+
+    def _peak_placement_bounds(self, plot: pg.PlotWidget) -> tuple[float, float]:
+        data_low, data_high = self._peak_value_bounds()
+        if plot is getattr(self, "fit_plot", None):
+            fit_low, fit_high = self._current_fit_default_range()
+            low = max(float(data_low), float(min(fit_low, fit_high)))
+            high = min(float(data_high), float(max(fit_low, fit_high)))
+            if high > low:
+                return low, high
+        return float(data_low), float(data_high)
+
+    def _peak_placement_x_at(self, plot: pg.PlotWidget, scene_pos) -> float | None:
+        if not getattr(self, "data_loaded", False):
+            return None
+        view_box = plot.getPlotItem().getViewBox()
+        if not view_box.sceneBoundingRect().contains(scene_pos):
+            return None
+        if _legend_contains_scene_pos(plot, scene_pos):
+            return None
+        try:
+            value = float(view_box.mapSceneToView(scene_pos).x())
+        except Exception:
+            return None
+        if not np.isfinite(value):
+            return None
+        low, high = self._peak_placement_bounds(plot)
+        if value < low or value > high:
+            return None
+        return value
+
+    def _on_peak_placement_mouse_moved(self, plot: pg.PlotWidget, scene_pos) -> None:
+        if not getattr(self, "_peak_placement_mode", False):
+            self._hide_peak_placement_guide(plot)
+            return
+        value = self._peak_placement_x_at(plot, scene_pos)
+        if value is None:
+            self._hide_peak_placement_guide(plot)
+            return
+        for other_plot in (self.preview_plot, self.fit_plot):
+            if other_plot is not plot:
+                guide = getattr(self, "_peak_placement_guides", {}).get(other_plot)
+                if guide is not None:
+                    guide.hide()
+        guide = self._ensure_peak_placement_guide(plot)
+        guide.setValue(float(value))
+        guide.show()
+        self._peak_placement_last_plot = plot
+        self._peak_placement_x = float(value)
+
+    def _set_peak_placement_mode(self, enabled: bool) -> None:
+        was_enabled = bool(getattr(self, "_peak_placement_mode", False))
+        enabled = bool(enabled)
+        if enabled and not getattr(self, "data_loaded", False):
+            enabled = False
+            try:
+                self.statusBar().showMessage("请先导入 XRD 数据，再使用图中添加峰功能。", 3500)
+            except Exception:
+                pass
+
+        if enabled:
+            baseline_button = getattr(self, "btn_manual_baseline", None)
+            if baseline_button is not None and baseline_button.isChecked():
+                baseline_button.setChecked(False)
+
+        self._peak_placement_mode = enabled
+        button = getattr(self, "add_peak_button", None)
+        if button is not None and button.isChecked() != enabled:
+            button.blockSignals(True)
+            button.setChecked(enabled)
+            button.blockSignals(False)
+
+        region = getattr(self, "preview_range_region", None)
+        if region is not None:
+            try:
+                # In placement mode, keep the region body fixed so a click in
+                # the selected area can still add a peak, but leave both blue
+                # dashed boundary lines draggable.
+                region.setMovable(not enabled)
+                for boundary_line in getattr(region, "lines", []):
+                    boundary_line.setMovable(True)
+                    self._set_resize_cursor(boundary_line)
+            except Exception:
+                pass
+        for lines in (
+            getattr(self, "peak_mu_lines_preview", []),
+            getattr(self, "peak_mu_lines_axes0", []),
+        ):
+            for line in lines:
+                if line is not None:
+                    try:
+                        line.setMovable(True)
+                        self._set_resize_cursor(line)
+                    except Exception:
+                        pass
+
+        for plot in (getattr(self, "preview_plot", None), getattr(self, "fit_plot", None)):
+            if plot is None:
+                continue
+            plot.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+            cursor = getattr(plot, "_click_projection_cursor", None)
+            if cursor is not None and hasattr(cursor, "clear"):
+                cursor.clear()
+            if not enabled:
+                self._hide_peak_placement_guide(plot)
+
+        if enabled:
+            try:
+                self.statusBar().showMessage(
+                    "添加峰模式：单击图中空白位置添加峰；蓝色范围线和已有 Peak 线仍可拖动；再次点击“添加”或按 Esc 退出。"
+                )
+            except Exception:
+                pass
+        elif was_enabled:
+            try:
+                self.statusBar().showMessage("已退出添加峰模式。", 2500)
+            except Exception:
+                pass
+        self._safe_draw_idle()
+
+    def _cancel_peak_placement_mode(self) -> None:
+        if getattr(self, "_peak_placement_mode", False):
+            self._set_peak_placement_mode(False)
+
+    def _peak_placement_adjustment_line_at(self, plot: pg.PlotWidget, scene_pos) -> bool:
+        """Return True when a placement click targets a range or existing Peak line."""
+        candidates = []
+        if plot is getattr(self, "preview_plot", None):
+            region = getattr(self, "preview_range_region", None)
+            candidates.extend(getattr(region, "lines", []) if region is not None else [])
+            candidates.extend(getattr(self, "peak_mu_lines_preview", []) or [])
+        elif plot is getattr(self, "fit_plot", None):
+            candidates.extend(getattr(self, "peak_mu_lines_axes0", []) or [])
+        candidates = [item for item in candidates if item is not None]
+        if not candidates:
+            return False
+        try:
+            for item in plot.scene().items(scene_pos):
+                current = item
+                for _ in range(8):
+                    if any(current is candidate for candidate in candidates):
+                        return True
+                    parent = getattr(current, "parentItem", None)
+                    current = parent() if callable(parent) else None
+                    if current is None:
+                        break
+        except Exception:
+            pass
+        return False
+
+    def _try_add_peak_from_plot_click(self, plot: pg.PlotWidget, event) -> bool:
+        if not getattr(self, "_peak_placement_mode", False):
+            return False
+        try:
+            if event.button() != Qt.LeftButton:
+                return False
+        except Exception:
+            return False
+        double_click = getattr(event, "double", False)
+        is_double_click = double_click() if callable(double_click) else bool(double_click)
+        if is_double_click:
+            event.accept()
+            return True
+        scene_pos = event.scenePos()
+        if self._peak_placement_adjustment_line_at(plot, scene_pos):
+            event.accept()
+            return True
+        if _line_coordinate_interaction_at(plot, scene_pos):
+            return False
+        value = self._peak_placement_x_at(plot, scene_pos)
+        if value is None:
+            return False
+        event.accept()
+        placed_value = round(float(value), 2)
+        self._peak_placement_last_plot = plot
+        self._peak_placement_x = placed_value
+        self.add_peak_control(value=placed_value)
+        self._restore_peak_placement_guide(plot)
+        try:
+            self.statusBar().showMessage(
+                f"已在 2θ = {placed_value:.2f}° 添加 Peak{len(self.peak_mu_sliders)}；可继续点击添加。",
+                3500,
+            )
+        except Exception:
+            pass
+        return True
 
     def _current_manual_baseline_state(self) -> dict:
         endpoint_y = getattr(self, "manual_baseline_endpoint_y", {"left": None, "right": None}) or {}
@@ -2364,7 +3523,7 @@ class PlotPanelMixin:
                 }
             )
         return {
-            "enabled": bool(getattr(self, "manual_baseline_enabled", False)),
+            "enabled": True,
             "edited": bool(getattr(self, "manual_baseline_edited", False)),
             "user_points": user_points,
             "endpoint_y": {
@@ -2374,9 +3533,15 @@ class PlotPanelMixin:
             "endpoint_deleted": sorted(str(v) for v in getattr(self, "manual_baseline_endpoint_deleted", set())),
         }
 
-    def _apply_manual_baseline_state(self, state: dict | None) -> None:
+    def _apply_manual_baseline_state(
+        self,
+        state: dict | None,
+        *,
+        redraw: bool = True,
+    ) -> None:
         state = dict(state or {})
-        self.manual_baseline_enabled = bool(state.get("enabled", False))
+        self.manual_baseline_enabled = True
+        self.manual_baseline_editing = not bool(getattr(self, "_peak_placement_mode", False))
         self.manual_baseline_edited = bool(state.get("edited", False))
         endpoint_y = dict(state.get("endpoint_y") or {})
         self.manual_baseline_endpoint_y = {
@@ -2401,30 +3566,32 @@ class PlotPanelMixin:
         button = getattr(self, "btn_manual_baseline", None)
         if button is not None:
             button.blockSignals(True)
-            button.setChecked(self.manual_baseline_enabled)
+            button.setChecked(self.manual_baseline_editing)
             button.blockSignals(False)
-        if self.manual_baseline_enabled:
+        if redraw:
             self._draw_manual_baseline_overlay()
-        else:
-            self._clear_manual_baseline_overlay()
 
     def _save_current_manual_baseline_state(self) -> None:
         index = getattr(self, "active_sample_index", -1)
         samples = getattr(self, "samples", [])
         if 0 <= index < len(samples):
-            samples[index].baseline_state = self._current_manual_baseline_state()
+            state = self._current_manual_baseline_state()
+            if samples[index].baseline_state != state:
+                samples[index].baseline_state = state
+                samples[index].result_is_current = False
+                if hasattr(self, "_mark_project_dirty"):
+                    self._mark_project_dirty()
 
     def _on_manual_baseline_toggled(self, checked: bool) -> None:
-        self.manual_baseline_enabled = bool(checked)
-        if self.manual_baseline_enabled:
+        if checked and getattr(self, "_peak_placement_mode", False):
+            self._set_peak_placement_mode(False)
+        self.manual_baseline_enabled = True
+        self.manual_baseline_editing = bool(checked)
+        if self.manual_baseline_editing:
             cursor = getattr(getattr(self, "fit_plot", None), "_click_projection_cursor", None)
             if cursor is not None and hasattr(cursor, "clear"):
                 cursor.clear()
-        self._save_current_manual_baseline_state()
-        if self.manual_baseline_enabled:
-            self._draw_manual_baseline_overlay()
-        else:
-            self._clear_manual_baseline_overlay()
+        self._draw_manual_baseline_overlay()
         self._safe_draw_idle()
 
     @staticmethod
@@ -2559,7 +3726,7 @@ class PlotPanelMixin:
     ) -> np.ndarray:
         auto_background, _, _ = self._auto_background_for_segment(x_values, y_values, angle_min, angle_max)
         state = dict(state or self._current_manual_baseline_state())
-        if not (state.get("enabled") and state.get("edited")):
+        if not state.get("edited"):
             return auto_background
         points = self._manual_baseline_anchor_points_for_segment(
             x_values,
@@ -2585,6 +3752,8 @@ class PlotPanelMixin:
                 pass
         self._manual_baseline_curve_item = None
         self._manual_baseline_anchor_items = []
+        self._manual_baseline_drag_anchor = None
+        self._manual_baseline_drag_anchor_id = None
 
     def _draw_manual_baseline_overlay(self) -> None:
         self._clear_manual_baseline_overlay()
@@ -2603,10 +3772,14 @@ class PlotPanelMixin:
         y_segment = y_data[mask]
         state = self._current_manual_baseline_state()
         background = self._compute_background_for_segment(x_segment, y_segment, low, high, state)
-        line = self._line(self.fit_plot, x_segment, background, "#2563eb", width=2.0, alpha=0.95)
+        editing = bool(getattr(self, "manual_baseline_editing", False))
+        line = BaselineCurveItem(self, x_segment, background, editing=editing)
         line.setZValue(2200)
+        self.fit_plot.addItem(line)
         self._manual_baseline_curve_item = line
 
+        if not editing:
+            return
         points = self._manual_baseline_anchor_points_for_segment(x_segment, y_segment, low, high, state)
         for point in points:
             item = BaselineAnchorItem(
@@ -2659,8 +3832,126 @@ class PlotPanelMixin:
                 continue
         return False
 
+    def _baseline_curve_event_position(self, event) -> tuple[float, float] | None:
+        """Map a baseline curve event to a finite, in-range plot position."""
+        try:
+            scene_pos = event.scenePos()
+            view_box = self.fit_plot.getPlotItem().getViewBox()
+            view_pos = view_box.mapSceneToView(scene_pos)
+            x_val = float(view_pos.x())
+            y_val = float(view_pos.y())
+        except Exception:
+            return None
+        if not np.isfinite(x_val) or not np.isfinite(y_val):
+            return None
+        angle_min, angle_max = self._normalize_angle_range()
+        low, high = sorted((float(angle_min), float(angle_max)))
+        return min(high, max(low, x_val)), y_val
+
+    def _activate_manual_baseline_editing_from_curve(self, curve) -> bool:
+        """Select the Baseline tool without recreating the curve handling the event."""
+        if getattr(self, "_peak_placement_mode", False):
+            return False
+        if not getattr(self, "manual_baseline_editing", False):
+            self.manual_baseline_editing = True
+            button = getattr(self, "btn_manual_baseline", None)
+            if button is not None:
+                button.blockSignals(True)
+                button.setChecked(True)
+                button.blockSignals(False)
+            if hasattr(curve, "set_editing"):
+                curve.set_editing(True)
+        return True
+
+    @staticmethod
+    def _baseline_curve_y_at_x(curve, x_val: float, fallback: float) -> float:
+        try:
+            curve_x, curve_y = curve.getData()
+            curve_x = np.asarray(curve_x, dtype=float)
+            curve_y = np.asarray(curve_y, dtype=float)
+            finite = np.isfinite(curve_x) & np.isfinite(curve_y)
+            if np.any(finite):
+                return float(np.interp(float(x_val), curve_x[finite], curve_y[finite]))
+        except Exception:
+            pass
+        return float(fallback)
+
+    def _add_manual_baseline_anchor_from_curve(self, curve, event) -> bool:
+        """Clicking the baseline inserts an anchor exactly on the current curve."""
+        if not self._activate_manual_baseline_editing_from_curve(curve):
+            return False
+        position = self._baseline_curve_event_position(event)
+        if position is None:
+            return False
+        x_val, cursor_y = position
+        y_val = self._baseline_curve_y_at_x(curve, x_val, cursor_y)
+        self._add_manual_baseline_anchor(x_val, y_val)
+        return True
+
+    @staticmethod
+    def _baseline_drag_event_flag(event, name: str) -> bool:
+        value = getattr(event, name, False)
+        try:
+            return bool(value()) if callable(value) else bool(value)
+        except Exception:
+            return False
+
+    def _drag_manual_baseline_from_curve(self, curve, event) -> bool:
+        """Create an anchor on drag start, then move it with the pointer."""
+        if not self._activate_manual_baseline_editing_from_curve(curve):
+            return False
+        position = self._baseline_curve_event_position(event)
+        if position is None:
+            return False
+        x_val, cursor_y = position
+        is_start = self._baseline_drag_event_flag(event, "isStart")
+        is_finish = self._baseline_drag_event_flag(event, "isFinish")
+
+        if is_start or getattr(self, "_manual_baseline_drag_anchor_id", None) is None:
+            point_id = int(getattr(self, "_manual_baseline_next_anchor_id", 1))
+            self._manual_baseline_next_anchor_id = point_id + 1
+            initial_y = self._baseline_curve_y_at_x(curve, x_val, cursor_y)
+            self.manual_baseline_user_points.append(
+                {"id": point_id, "x": float(x_val), "y": float(initial_y)}
+            )
+            anchor = BaselineAnchorItem(self, point_id, "user", (float(x_val), float(initial_y)))
+            anchor.sigPositionChanged.connect(self._on_manual_baseline_anchor_position_changed)
+            anchor.sigPositionChangeFinished.connect(self._on_manual_baseline_anchor_change_finished)
+            self.fit_plot.addItem(anchor, ignoreBounds=True)
+            self._manual_baseline_anchor_items.append(anchor)
+            self._manual_baseline_drag_anchor = anchor
+            self._manual_baseline_drag_anchor_id = point_id
+
+        anchor_id = getattr(self, "_manual_baseline_drag_anchor_id", None)
+        anchor = getattr(self, "_manual_baseline_drag_anchor", None)
+        if anchor_id is None or anchor is None:
+            return False
+        for point in self.manual_baseline_user_points:
+            if int(point.get("id", -1)) == int(anchor_id):
+                point["x"] = float(x_val)
+                point["y"] = float(cursor_y)
+                break
+        self._syncing_manual_baseline_anchor = True
+        try:
+            anchor.setPos(float(x_val), float(cursor_y))
+        finally:
+            self._syncing_manual_baseline_anchor = False
+        self.manual_baseline_edited = True
+        self._save_current_manual_baseline_state()
+        self._refresh_manual_baseline_curve()
+
+        if is_finish:
+            self._manual_baseline_drag_anchor = None
+            self._manual_baseline_drag_anchor_id = None
+            self._save_current_manual_baseline_state()
+            self._draw_manual_baseline_overlay()
+            self._safe_draw_idle()
+        return True
+
     def _on_fit_plot_mouse_clicked(self, event) -> None:
-        if not getattr(self, "manual_baseline_enabled", False):
+        if self._try_add_peak_from_plot_click(self.fit_plot, event):
+            return
+        if not getattr(self, "manual_baseline_editing", False):
             return
         try:
             if event.button() != Qt.LeftButton or event.isAccepted():
@@ -2705,7 +3996,7 @@ class PlotPanelMixin:
     def _on_manual_baseline_anchor_position_changed(self, item) -> None:
         if getattr(self, "_syncing_manual_baseline_anchor", False):
             return
-        if not getattr(self, "manual_baseline_enabled", False):
+        if not getattr(self, "manual_baseline_editing", False):
             return
         pos = item.pos()
         try:
@@ -3190,6 +4481,8 @@ class PlotPanelMixin:
         self._save_current_peak_states()
 
     def _on_preview_plot_mouse_clicked(self, event) -> None:
+        if self._try_add_peak_from_plot_click(self.preview_plot, event):
+            return
         try:
             if event.button() != Qt.RightButton or event.isAccepted():
                 return
@@ -3318,7 +4611,10 @@ class PlotPanelMixin:
         index = getattr(self, "active_sample_index", -1)
         samples = getattr(self, "samples", [])
         if 0 <= index < len(samples):
+            changed = samples[index].plot_view_state != self.plot_view_state
             samples[index].plot_view_state = self.plot_view_state
+            if changed and hasattr(self, "_mark_project_dirty"):
+                self._mark_project_dirty()
 
     def _restore_sample_plot_view_state(self) -> None:
         state = getattr(self, "plot_view_state", {}) or {}
@@ -3386,6 +4682,7 @@ class PlotPanelMixin:
     def _set_fit_view_range(self, left: float, right: float) -> None:
         self._set_plot_xrange(self.fit_plot, left, right)
         self._auto_fit_y_range(left, right)
+        self._position_all_fit_peak_labels()
 
     def _peak_hit_tolerance(self, plot: pg.PlotWidget, minimum: float = 0.12, pixels: float = 8.0) -> float:
         try:
@@ -3414,6 +4711,9 @@ class PlotPanelMixin:
                 line.setVisible(self._peak_visible(peak_idx))
             except Exception:
                 pass
+        if "fit_plot" in (views or {}):
+            self._position_all_fit_peak_labels()
+            self._position_fit_peak_label(peak_idx, mu)
 
     @staticmethod
     def _set_span_bounds(span, _ax, left: float, right: float) -> None:
@@ -3437,6 +4737,10 @@ class PlotPanelMixin:
 
     def _make_peak_line(self, peak_idx: int, value: float, *, movable: bool, source: str):
         color = self._peak_color(peak_idx)
+        requested_movable = bool(movable)
+        # Existing Peak lines remain editable while the add tool is active;
+        # only clicks on empty plot space create another peak.
+        movable = requested_movable
         line = pg.InfiniteLine(
             pos=float(value),
             angle=90,
@@ -3469,7 +4773,7 @@ class PlotPanelMixin:
             line.setBounds((float(low), float(high)))
         except Exception:
             pass
-        if movable:
+        if requested_movable:
             line.sigPositionChanged.connect(
                 lambda item, idx=peak_idx, src=source: self._on_peak_line_position_changed(idx, item, src)
             )
@@ -3498,6 +4802,7 @@ class PlotPanelMixin:
             )
             self.fit_plot.addItem(line, ignoreBounds=True)
             self.peak_mu_lines_axes0.append(line)
+            self._position_fit_peak_label(peak_idx, self.peak_mu_sliders[peak_idx].get())
 
     def _refresh_axes0_context_for_view(self) -> None:
         if not getattr(self, "results_ready", False) or not getattr(self, "data_loaded", False):
@@ -3506,6 +4811,7 @@ class PlotPanelMixin:
         self._update_axes0_context_data(float(x_range[0]), float(x_range[1]), autoscale=False)
         self.fit_plot.setXRange(x_range[0], x_range[1], padding=0)
         self.fit_plot.setYRange(y_range[0], y_range[1], padding=0)
+        self._position_all_fit_peak_labels()
 
     def _redraw_axes0_range_preview(self, angle_min: float, angle_max: float) -> None:
         self._clear_plot(self.fit_plot, title="拟合范围预览")
@@ -3610,6 +4916,39 @@ class PlotPanelMixin:
                     line.setValue(float(value))
                 except Exception:
                     pass
+        self._position_fit_peak_label(peak_idx, value)
+
+    def _position_fit_peak_label(self, peak_idx: int, value: float, *, label=None) -> None:
+        """Place a Peak caption at the top-right of its vertical selection line."""
+        if label is None:
+            label = getattr(self, "_fit_peak_labels", {}).get(int(peak_idx))
+        if label is None:
+            return
+        try:
+            x_range, y_range = self._plot_range(self.fit_plot)
+            x_low, x_high = sorted((float(x_range[0]), float(x_range[1])))
+            y_low, y_high = sorted((float(y_range[0]), float(y_range[1])))
+            if not all(np.isfinite(v) for v in (x_low, x_high, y_low, y_high)):
+                return
+            x_span = max(x_high - x_low, np.finfo(float).eps)
+            y_span = max(y_high - y_low, np.finfo(float).eps)
+            x_value = float(value) + x_span * FIT_PEAK_LABEL_X_OFFSET_FRACTION
+            y_value = y_high - y_span * FIT_PEAK_LABEL_TOP_MARGIN_FRACTION
+            label.setPos(x_value, y_value)
+        except Exception:
+            pass
+
+    def _position_all_fit_peak_labels(self) -> None:
+        """Keep every Peak caption aligned when the fitted view range changes."""
+        sliders = getattr(self, "peak_mu_sliders", [])
+        for peak_idx, label in getattr(self, "_fit_peak_labels", {}).items():
+            peak_idx = int(peak_idx)
+            if 0 <= peak_idx < len(sliders):
+                self._position_fit_peak_label(
+                    peak_idx,
+                    sliders[peak_idx].get(),
+                    label=label,
+                )
 
     def _on_peak_line_position_changed(self, peak_idx: int, line, _source: str) -> None:
         if self._syncing_peak_line or not getattr(self, "data_loaded", False):
@@ -3667,6 +5006,8 @@ class PlotPanelMixin:
         self.preview_range_region.sigRegionChanged.connect(self._on_range_region_changed)
         self.preview_range_region.sigRegionChangeFinished.connect(self._on_range_region_finished)
         self.preview_plot.addItem(self.preview_range_region)
+        if getattr(self, "_peak_placement_mode", False):
+            self.preview_range_region.setMovable(False)
         self._install_range_region_context_menu(self.preview_range_region)
         self.preview_range_span = self.preview_range_region
         try:
@@ -3679,6 +5020,9 @@ class PlotPanelMixin:
         range_hover_pen = self._curve_pen("#2563eb", width=2.4, style=Qt.DashLine, alpha=1.0)
         for line in (self.line_min, self.line_max):
             try:
+                # LinearRegionItem disables its two boundary lines together
+                # with the body. Re-enable just the lines in add-peak mode.
+                line.setMovable(True)
                 line.setPen(range_pen)
                 line.setHoverPen(range_hover_pen)
             except Exception:
@@ -3720,11 +5064,188 @@ class PlotPanelMixin:
             self._draw_manual_baseline_overlay()
         self._safe_draw_idle()
 
+    def _current_runtime_plot_cache(self) -> dict:
+        index = int(getattr(self, "active_sample_index", -1))
+        samples = getattr(self, "samples", [])
+        if 0 <= index < len(samples):
+            sample = samples[index]
+            cache = getattr(sample, "runtime_plot_cache", None)
+            if cache is None:
+                cache = {}
+                sample.runtime_plot_cache = cache
+            return cache
+        cache = getattr(self, "_transient_runtime_plot_cache", None)
+        if cache is None:
+            cache = {}
+            self._transient_runtime_plot_cache = cache
+        return cache
+
+    def _fit_curve_data_cache(self, active_indices: list[int]) -> dict:
+        """Return display curves from runtime bases or a compact project snapshot."""
+        peak_infos = list(getattr(self, "all_peak_info", []) or [])
+        curve_snapshot = getattr(self, "fit_curve_snapshot", None)
+        token = (
+            tuple(int(value) for value in active_indices),
+            id(getattr(self, "x_segment", None)),
+            id(getattr(self, "y_segment_raw", None)),
+            id(getattr(self, "y_segment", None)),
+            id(getattr(self, "background", None)),
+            id(getattr(self, "all_peak_info", None)),
+            id(curve_snapshot),
+        )
+        runtime_cache = self._current_runtime_plot_cache()
+        cached = runtime_cache.get("fit_curve_data")
+        if isinstance(cached, dict) and cached.get("token") == token:
+            return cached
+
+        x = np.asarray(self.x_segment, dtype=float)
+        y_raw = np.asarray(self.y_segment_raw, dtype=float)
+        y = np.asarray(self.y_segment, dtype=float)
+        background = np.asarray(self.background, dtype=float)
+
+        if isinstance(curve_snapshot, dict) and curve_snapshot.get("peaks"):
+            snapshot_by_peak = {
+                int(item.get("peak_id", index)): item
+                for index, item in enumerate(curve_snapshot.get("peaks") or [])
+            }
+            peak_specs = []
+            total_signal = np.zeros_like(x, dtype=float)
+            snapshot_valid = True
+            for i, info in enumerate(peak_infos):
+                fallback_peak_id = active_indices[i] if i < len(active_indices) else i
+                peak_id = int(info.get("peak_id", fallback_peak_id))
+                saved_peak = snapshot_by_peak.get(peak_id)
+                if not isinstance(saved_peak, dict):
+                    snapshot_valid = False
+                    break
+                peak_signal = np.asarray(saved_peak.get("signal", []), dtype=float).reshape(-1)
+                if peak_signal.size != x.size:
+                    snapshot_valid = False
+                    break
+                peak_fit = peak_signal + background
+                total_signal += peak_signal
+                saved_components = {
+                    int(item.get("detail_index", index)): item
+                    for index, item in enumerate(saved_peak.get("components") or [])
+                }
+                component_specs = []
+                for detail_index, detail in enumerate(info.get("peak_details", []) or []):
+                    saved_component = saved_components.get(detail_index)
+                    if not isinstance(saved_component, dict):
+                        continue
+                    component_signal = np.asarray(
+                        saved_component.get("signal", []), dtype=float
+                    ).reshape(-1)
+                    if component_signal.size != x.size:
+                        snapshot_valid = False
+                        break
+                    component_specs.append(
+                        {
+                            "detail_index": int(detail_index),
+                            "detail": detail,
+                            "indices": np.asarray(detail.get("indices", []), dtype=int),
+                            "signal": component_signal,
+                            "fit": component_signal + background,
+                            "peak_index": int(np.nanargmax(component_signal)),
+                        }
+                    )
+                if not snapshot_valid:
+                    break
+                peak_specs.append(
+                    {
+                        "peak_id": peak_id,
+                        "info": info,
+                        "signal": peak_signal,
+                        "fit": peak_fit,
+                        "peak_index": int(np.nanargmax(peak_signal)),
+                        "components": component_specs,
+                    }
+                )
+            if snapshot_valid and len(peak_specs) == len(peak_infos):
+                cached = {
+                    "token": token,
+                    "x": x,
+                    "y_raw": y_raw,
+                    "y": y,
+                    "background": background,
+                    "peak_specs": peak_specs,
+                    "total_signal": total_signal,
+                    "total_fit": total_signal + background,
+                }
+                runtime_cache["fit_curve_data"] = cached
+                return cached
+
+        y_scale = float(np.nanmax(y)) if y.size else 1.0
+        peak_specs = []
+        total_signal = np.zeros_like(x, dtype=float)
+        for i, info in enumerate(peak_infos):
+            fallback_peak_id = active_indices[i] if i < len(active_indices) else i
+            peak_id = int(info.get("peak_id", fallback_peak_id))
+            f_segment = np.asarray(info["f_segment"], dtype=float)
+            basis_k1 = np.asarray(info["basis_k1"], dtype=float)
+            basis_k2 = np.asarray(info["basis_k2"], dtype=float)
+            peak_signal = (basis_k1.dot(f_segment) + basis_k2.dot(f_segment)) * y_scale
+            peak_fit = peak_signal + background
+            total_signal += peak_signal
+            component_specs = []
+            for detail_index, detail in enumerate(info.get("peak_details", [])):
+                indices = np.asarray(detail.get("indices", []), dtype=int)
+                indices = indices[
+                    (indices >= 0)
+                    & (indices < f_segment.size)
+                    & (indices < basis_k1.shape[1])
+                    & (indices < basis_k2.shape[1])
+                ]
+                if indices.size == 0:
+                    continue
+                weights = f_segment[indices]
+                component_signal = (
+                    basis_k1[:, indices].dot(weights)
+                    + basis_k2[:, indices].dot(weights)
+                ) * y_scale
+                component_fit = component_signal + background
+                component_specs.append(
+                    {
+                        "detail_index": int(detail_index),
+                        "detail": detail,
+                        "indices": indices,
+                        "signal": component_signal,
+                        "fit": component_fit,
+                        "peak_index": int(np.nanargmax(component_signal)),
+                    }
+                )
+            peak_specs.append(
+                {
+                    "peak_id": peak_id,
+                    "info": info,
+                    "signal": peak_signal,
+                    "fit": peak_fit,
+                    "peak_index": int(np.nanargmax(peak_signal)),
+                    "components": component_specs,
+                }
+            )
+
+        cached = {
+            "token": token,
+            "x": x,
+            "y_raw": y_raw,
+            "y": y,
+            "background": background,
+            "peak_specs": peak_specs,
+            "total_signal": total_signal,
+            "total_fit": total_signal + background,
+        }
+        runtime_cache["fit_curve_data"] = cached
+        return cached
+
     def update_multi_peak_plots(self):
         """Update the fitted XRD plot and the particle-size distribution plot."""
         active_indices = list(getattr(self, "result_active_peak_indices", self.active_peak_indices))
+        curve_data = self._fit_curve_data_cache(active_indices)
 
         self._clear_plot(self.fit_plot, title="XRD多峰拟合及粒径分解")
+        self._reset_fit_component_links()
+        self.fit_plot._sample_curve_hovered_callback = self._on_fit_component_hover_index
         self.fit_plot.addLegend(
             offset=(10, 10),
             labelTextColor="#111827",
@@ -3737,10 +5258,9 @@ class PlotPanelMixin:
         self.axes0_context_artists = []
         self.fit_marker_text_items = []
 
-        x = np.asarray(self.x_segment, dtype=float)
-        y_raw = np.asarray(self.y_segment_raw, dtype=float)
-        y = np.asarray(self.y_segment, dtype=float)
-        bg = np.asarray(self.background, dtype=float)
+        x = curve_data["x"]
+        y_raw = curve_data["y_raw"]
+        bg = curve_data["background"]
         fit_sources = []
 
         if getattr(self, "data_loaded", False):
@@ -3750,34 +5270,26 @@ class PlotPanelMixin:
         self._line(self.fit_plot, x, bg, "#111827", width=1.4, style=Qt.DashLine, alpha=0.72, name="背景")
 
         fit_sources.extend([(x, y_raw), (x, bg)])
-        total_fit_curve = np.zeros_like(x, dtype=float)
-
-        for i, info in enumerate(self.all_peak_info):
-            peak_id = active_indices[i] if i < len(active_indices) else i
-            f_segment = np.asarray(info["f_segment"], dtype=float)
-            basis_k1 = np.asarray(info["basis_k1"], dtype=float)
-            basis_k2 = np.asarray(info["basis_k2"], dtype=float)
+        for peak_spec in curve_data["peak_specs"]:
+            peak_id = int(peak_spec["peak_id"])
             peak_color = self._peak_color(peak_id)
-
-            peak_fit = (basis_k1.dot(f_segment) + basis_k2.dot(f_segment)) * y.max() + bg
-            total_fit_curve += peak_fit - bg
+            peak_fit = peak_spec["fit"]
             fit_sources.append((x, peak_fit))
 
-            for j, detail in enumerate(info.get("peak_details", [])):
-                idx = detail.get("indices", None)
-                if idx is None or len(idx) == 0:
-                    continue
-                idx = np.asarray(idx, dtype=int)
-                f_component = np.zeros_like(f_segment)
-                f_component[idx] = f_segment[idx]
-                comp_fit = (basis_k1[:, idx].dot(f_component[idx]) + basis_k2[:, idx].dot(f_component[idx])) * y.max() + bg
+            for component_spec in peak_spec["components"]:
+                j = int(component_spec["detail_index"])
+                detail = component_spec["detail"]
+                comp_fit = component_spec["fit"]
                 fit_sources.append((x, comp_fit))
                 color = COMPONENT_COLORS[j % len(COMPONENT_COLORS)]
                 line = self._line(self.fit_plot, x, comp_fit, color, width=1.5, alpha=0.95)
                 fill_items = self._add_fill(self.fit_plot, x, comp_fit, bg, color, alpha=0.24)
                 line.setZValue(15)
-                pk_idx = int(np.nanargmax(comp_fit - bg))
+                pk_idx = int(component_spec["peak_index"])
                 peak_anchor = (float(x[pk_idx]), float(comp_fit[pk_idx]))
+                component_key = (int(peak_id), int(j))
+                interaction_index = len(self._fit_component_key_by_interaction_index)
+                self._fit_component_key_by_interaction_index[interaction_index] = component_key
                 label = DraggableMarkerTextItem(
                     self,
                     self.fit_plot,
@@ -3785,32 +5297,71 @@ class PlotPanelMixin:
                     color,
                     peak_anchor,
                     marker_key=f"component:{peak_id}:{j}",
+                    component_center=float(detail["center"]),
                     fill=pg.mkBrush(255, 255, 255, 205),
                 )
                 label.setZValue(40)
                 self.fit_plot.addItem(label)
-                label.setPos(float(x[pk_idx]), float(comp_fit[pk_idx] * 1.05))
+                default_label_pos = (float(x[pk_idx]), float(comp_fit[pk_idx] * 1.05))
+                label._xrd_default_pos = default_label_pos
+                label.setPos(*default_label_pos)
                 label.set_marker_visible(bool(getattr(self, "marker_text_visible", True)))
                 self.fit_marker_text_items.append(label)
+                self._fit_component_links[component_key] = {
+                    "interaction_index": interaction_index,
+                    "peak_id": int(peak_id),
+                    "detail_index": int(j),
+                    "fit_line": line,
+                    "fit_base_pen": _copy_pen_option(line.opts.get("pen")),
+                    "fit_base_z": float(line.zValue()),
+                    "fit_fill": fill_items,
+                    "fit_label": label,
+                }
+                interaction_label = (
+                    f"Peak{peak_id + 1} · {float(detail['center']):.2f} nm"
+                    f" ({float(detail['percentage']):.2f}%)"
+                )
+                self._fit_component_links[component_key]["interaction_label"] = interaction_label
+                _register_sample_curve(
+                    self.fit_plot,
+                    line,
+                    sample_index=interaction_index,
+                    label=interaction_label,
+                    x_values=x,
+                    y_values=comp_fit,
+                )
+                try:
+                    line.setCursor(Qt.PointingHandCursor)
+                    line.sigClicked.connect(
+                        lambda _item, event, key=component_key: self._on_fit_component_line_clicked(key, event)
+                    )
+                except Exception:
+                    pass
 
-            pk_idx = int(np.nanargmax(peak_fit - bg))
+            pk_idx = int(peak_spec["peak_index"])
             peak_label = pg.TextItem(
                 text=f"Peak{peak_id + 1}",
                 color=peak_color,
-                anchor=(0.5, 1.0),
+                anchor=(0.0, 0.0),
                 fill=pg.mkBrush(255, 255, 255, 215),
             )
-            peak_label._xrd_marker_key = f"peak:{peak_id}"
             peak_label.setZValue(45)
             self.fit_plot.addItem(peak_label)
-            peak_label.setPos(float(x[pk_idx]), float(peak_fit[pk_idx]))
+            peak_mu = (
+                float(self.peak_mu_sliders[peak_id].get())
+                if 0 <= peak_id < len(getattr(self, "peak_mu_sliders", []))
+                else float(x[pk_idx])
+            )
+            self._position_fit_peak_label(peak_id, peak_mu, label=peak_label)
             peak_label.setVisible(bool(getattr(self, "marker_text_visible", True)))
             self.fit_marker_text_items.append(peak_label)
+            self._fit_peak_labels[int(peak_id)] = peak_label
 
-        self._line(self.fit_plot, x, total_fit_curve + bg, "#111111", width=2.4, alpha=0.76, name="总拟合")
+        total_fit_curve = curve_data["total_fit"]
+        self._line(self.fit_plot, x, total_fit_curve, "#111111", width=2.4, alpha=0.76, name="总拟合")
         self.fit_plot.setLabel("left", "Intensity")
         self.fit_plot.setLabel("bottom", "2θ (°)")
-        fit_sources.append((x, total_fit_curve + bg))
+        fit_sources.append((x, total_fit_curve))
         self._set_fit_autorange_sources(*fit_sources)
         self._set_fit_view_range(float(np.nanmin(x)), float(np.nanmax(x)))
         self._redraw_axes0_peak_markers()
@@ -3825,11 +5376,13 @@ class PlotPanelMixin:
 
     def _redraw_size_distribution_plot(self, active_indices: list[int]) -> None:
         self._clear_plot(self.size_plot, title="晶粒尺寸分布 (总分布 vs 分峰)")
+        self.size_plot._sample_curve_hovered_callback = self._on_fit_component_hover_index
         self._ensure_plot_legend(self.size_plot)
         self.legend_handles = {}
         self.actual_components = {}
         self.dist_texts = {}
         self._size_visibility = dict(getattr(self, "_size_visibility", {}))
+        self._size_total_inclusion = dict(getattr(self, "_size_total_inclusion", {}))
 
         eps = 1e-12
         D_range = np.asarray(self.D_range, dtype=float)
@@ -3851,7 +5404,6 @@ class PlotPanelMixin:
             "#111111",
             width=2.4,
             style=Qt.DashLine,
-            name=self._size_distribution_legend_label(),
         )
         global_fill = self._add_fill(self.size_plot, D_range, global_y_pdf, np.zeros_like(global_y_pdf), "#6b7280", alpha=0.18)
         self.actual_components["global"] = {
@@ -3862,25 +5414,43 @@ class PlotPanelMixin:
             "y": global_y_pdf,
         }
         self.dist_texts["global"] = []
-        self._bind_size_legend_toggle("global", self._size_distribution_legend_label())
+        self._bind_size_legend_toggle(
+            "global", self._size_distribution_legend_label(), global_line
+        )
 
         y_max = float(np.nanmax(global_y_pdf)) if len(global_y_pdf) else 1.0
 
         for i, info in enumerate(self.all_peak_info):
-            peak_id = active_indices[i] if i < len(active_indices) else i
+            fallback_peak_id = active_indices[i] if i < len(active_indices) else i
+            peak_id = int(info.get("peak_id", fallback_peak_id))
             color = self._peak_color(peak_id)
             f_total = peak_weights[i] if i < len(peak_weights) else np.zeros_like(D_range)
             line_y_pdf = f_total / total_weight
             label = self._size_distribution_legend_label(peak_id)
-            line = self._line(self.size_plot, D_range, line_y_pdf, color, width=2.0, name=label)
-            fill = self._add_fill(self.size_plot, D_range, line_y_pdf, np.zeros_like(line_y_pdf), color, alpha=0.12)
+            line = self._line(self.size_plot, D_range, line_y_pdf, color, width=2.0)
+            valid_details = []
+            for j, det in enumerate(info.get("peak_details", [])):
+                idx = np.asarray(det.get("indices", []), dtype=int)
+                idx = idx[(idx >= 0) & (idx < D_range.size)]
+                if idx.size:
+                    valid_details.append((j, det, idx))
+
+            # Use either the original whole-Peak fill or the partitioned range
+            # fills, never both. Stacking both translucent layers made the
+            # distribution look noticeably more saturated than before.
+            fill = {}
+            if not valid_details:
+                fill = self._add_fill(
+                    self.size_plot,
+                    D_range,
+                    line_y_pdf,
+                    np.zeros_like(line_y_pdf),
+                    color,
+                    alpha=0.12,
+                )
             items = [line, *fill.values()]
             texts = []
-            for det in info.get("peak_details", []):
-                idx = det.get("indices", [])
-                if len(idx) == 0:
-                    continue
-                idx = np.asarray(idx, dtype=int)
+            for j, det, idx in valid_details:
                 det_center = float(det.get("center", D_range[int(idx[0])]))
                 if mode == "number":
                     local_max_idx = int(np.nanargmax(line_y_pdf[idx]))
@@ -3892,12 +5462,62 @@ class PlotPanelMixin:
                     label_center = det_center
                 cy = float(np.interp(cx, D_range, line_y_pdf))
                 y_max = max(y_max, cy)
-                txt = pg.TextItem(text=f"{label_center:.2f}nm", color=color, anchor=(0.5, 1.0))
+                # Every size subrange belongs to this XRD Peak, so it inherits
+                # the Peak color. Hover/lock emphasis supplies the mapping to
+                # the differently colored fitted component on the left.
+                component_color = color
+                txt = pg.TextItem(text=f"{label_center:.2f}nm", color=component_color, anchor=(0.5, 1.0))
                 txt.setZValue(30)
                 self.size_plot.addItem(txt)
                 txt.setPos(cx, cy * 1.05)
                 texts.append(txt)
                 items.append(txt)
+                range_x, range_y = self._size_component_display_range(
+                    D_range,
+                    line_y_pdf,
+                    idx,
+                    left_boundary=det.get("left_boundary"),
+                    right_boundary=det.get("right_boundary"),
+                )
+                range_line = self._line(
+                    self.size_plot,
+                    range_x,
+                    range_y,
+                    component_color,
+                    width=1.35,
+                    alpha=0.90,
+                )
+                range_line.setZValue(24)
+                range_fill = self._add_fill(
+                    self.size_plot,
+                    range_x,
+                    range_y,
+                    np.zeros_like(range_y),
+                    component_color,
+                    alpha=0.12,
+                )
+                range_fill["fill"].setZValue(18)
+                items.extend([range_line, *range_fill.values()])
+                component_key = (int(peak_id), int(j))
+                link = self._fit_component_links.get(component_key)
+                if link is not None:
+                    link.update(
+                        {
+                            "size_line": range_line,
+                            "size_base_pen": _copy_pen_option(range_line.opts.get("pen")),
+                            "size_base_z": float(range_line.zValue()),
+                            "size_fill": range_fill,
+                            "size_label": txt,
+                        }
+                    )
+                    _register_sample_curve(
+                        self.size_plot,
+                        range_line,
+                        sample_index=int(link["interaction_index"]),
+                        label=str(link.get("interaction_label") or f"Peak{peak_id + 1}"),
+                        x_values=range_x,
+                        y_values=range_y,
+                    )
             self.actual_components[peak_id] = {
                 "items": items,
                 "line": line,
@@ -3906,16 +5526,23 @@ class PlotPanelMixin:
                 "y": line_y_pdf,
             }
             self.dist_texts[peak_id] = texts
-            self._bind_size_legend_toggle(peak_id, label)
+            self._bind_size_legend_toggle(peak_id, label, line)
 
         for component_id in self.actual_components:
             self._apply_size_component_visibility(component_id)
-        self._update_visible_size_total()
+        self._update_included_size_total()
+        self._update_size_legend_style("global")
 
         self.size_plot.setLabel("left", self._size_distribution_axis_label())
         self.size_plot.setLabel("bottom", "Particle size (nm)")
         self._set_plot_xrange(self.size_plot, float(np.nanmin(D_range)), float(np.nanmax(D_range)))
         self.size_plot.setYRange(0.0, y_max * 1.2 if y_max > 0 else 1.0, padding=0)
+        focus_key = self._fit_component_locked_key or self._fit_component_hover_key
+        if focus_key in self._fit_component_links:
+            self._set_fit_component_controller_hover(
+                self._fit_component_links[focus_key].get("interaction_index")
+            )
+        self._apply_fit_component_focus(focus_key, force=True)
 
     def on_pick_legend(self, event):
         return

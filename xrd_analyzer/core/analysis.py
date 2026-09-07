@@ -5,7 +5,37 @@ NNLS 结果的后处理：从晶粒尺寸分布中识别局部峰，
 计算各峰的中心、占比等统计量，并构建完整的 all_peak_info 数据结构。
 """
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
+
+
+def calculate_rfit_percent(y_observed, y_calculated) -> float:
+    """Return the unweighted relative profile residual in percent.
+
+    ``Rfit`` is deliberately kept distinct from the statistically weighted
+    Rietveld ``Rwp``.  Both arrays must describe the same (normally
+    background-subtracted) profile on the same grid::
+
+        Rfit = 100 * ||y_observed - y_calculated||_2 / ||y_observed||_2
+
+    Non-finite point pairs are ignored.  ``nan`` is returned when no usable
+    signal remains, so callers never report a misleading perfect fit for an
+    empty profile.
+    """
+    observed = np.asarray(y_observed, dtype=float).reshape(-1)
+    calculated = np.asarray(y_calculated, dtype=float).reshape(-1)
+    if observed.shape != calculated.shape:
+        raise ValueError("y_observed and y_calculated must have the same shape")
+
+    valid = np.isfinite(observed) & np.isfinite(calculated)
+    if not np.any(valid):
+        return float("nan")
+    observed = observed[valid]
+    calculated = calculated[valid]
+    denominator = float(np.linalg.norm(observed))
+    if denominator <= np.finfo(float).eps:
+        return float("nan")
+    return 100.0 * float(np.linalg.norm(observed - calculated)) / denominator
 
 
 def volume_to_number_distribution(f, D):
@@ -44,8 +74,9 @@ def calculate_peak_info(f_dist: np.ndarray, peak_indices: np.ndarray,
     """
     将一维分布 f_dist 中的局部峰信息提取出来。
 
-    采用 Voronoi 分割（每个 D 点归属到距离最近的局部峰），
-    计算各峰的中心位置、相对占比，以及所属 D 索引列表。
+    采用谷底分割：对相邻局部峰之间的分布做轻微平滑并寻找最低点，
+    再以该谷底作为两个粒径群体的公共边界。平滑结果只用于定位
+    边界；相对占比始终由原始 f_dist 权重计算。
 
     Parameters
     ----------
@@ -56,27 +87,59 @@ def calculate_peak_info(f_dist: np.ndarray, peak_indices: np.ndarray,
     Returns
     -------
     peak_info : list[dict]
-        每个 dict 包含 'center'、'percentage'、'indices'
+        每个 dict 包含 'center'、'percentage'、'indices'，以及用于连续
+        绘图的 'left_boundary'、'right_boundary'
     percentages : list[float]
     """
+    f_dist = np.asarray(f_dist, dtype=float).reshape(-1)
+    D_range = np.asarray(D_range, dtype=float).reshape(-1)
+    peak_indices = np.asarray(peak_indices, dtype=int).reshape(-1)
+    if f_dist.size != D_range.size:
+        raise ValueError("f_dist and D_range must have the same length")
+    peak_indices = np.unique(peak_indices[(peak_indices >= 0) & (peak_indices < f_dist.size)])
     if f_dist.sum() == 0 or len(peak_indices) == 0:
         return [], []
 
     total_weight = f_dist.sum()
 
-    # 将每个 D 点分配给最近的局部峰（完整 Voronoi 覆盖，无死角）
-    assignments = np.argmin(
-        np.abs(D_range[:, np.newaxis] - D_range[peak_indices]), axis=1
+    # A one-grid-point Gaussian smoothing suppresses isolated numerical teeth
+    # without altering the weights used below for quantitative percentages.
+    valley_profile = (
+        gaussian_filter1d(f_dist, sigma=1.0, mode="nearest")
+        if f_dist.size >= 3
+        else f_dist.copy()
     )
+    cut_indices: list[int] = []
+    boundary_positions: list[float] = []
+    for left_peak, right_peak in zip(peak_indices[:-1], peak_indices[1:]):
+        left_peak = int(left_peak)
+        right_peak = int(right_peak)
+        if right_peak - left_peak > 1:
+            interior = np.arange(left_peak + 1, right_peak, dtype=int)
+            valley_index = int(interior[int(np.nanargmin(valley_profile[interior]))])
+            boundary_position = float(D_range[valley_index])
+        else:
+            # Adjacent peak samples have no measured valley point. Split at
+            # their shared bin edge so both peak samples remain represented.
+            valley_index = left_peak
+            boundary_position = 0.5 * (
+                float(D_range[left_peak]) + float(D_range[right_peak])
+            )
+        cut_indices.append(valley_index)
+        boundary_positions.append(boundary_position)
 
     peak_info = []
     for i, pk_idx in enumerate(peak_indices):
-        idx = np.where(assignments == i)[0]
+        start = 0 if i == 0 else cut_indices[i - 1] + 1
+        stop = f_dist.size if i == len(peak_indices) - 1 else cut_indices[i] + 1
+        idx = np.arange(start, stop, dtype=int)
         peak_weight = float(f_dist[idx].sum())
         peak_info.append({
-            "center":     float(D_range[pk_idx]),
-            "percentage": (peak_weight / total_weight * 100.0) if total_weight > 0 else 0.0,
-            "indices":    idx,
+            "center":         float(D_range[pk_idx]),
+            "percentage":     (peak_weight / total_weight * 100.0) if total_weight > 0 else 0.0,
+            "indices":        idx,
+            "left_boundary":  float(D_range[0]) if i == 0 else boundary_positions[i - 1],
+            "right_boundary": float(D_range[-1]) if i == len(peak_indices) - 1 else boundary_positions[i],
         })
 
     return peak_info, [info["percentage"] for info in peak_info]
@@ -132,6 +195,7 @@ def build_all_peak_info(best_f_total: np.ndarray,
         peak_details, _ = calculate_peak_info(f_peak, local_peaks, D_range)
 
         all_peak_info.append({
+            "peak_id":        int(active_peak_indices[i]),
             "f_segment":      f_peak,
             "volume_dist":    volume_dist,
             "number_dist":    number_dist,
