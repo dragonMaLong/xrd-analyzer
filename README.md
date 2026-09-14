@@ -205,7 +205,7 @@ xrd-analyzer/
 
 如果本工具对你的研究有帮助，请引用：
 
-> [论文发表后在此添加 / Citation will be added after publication]
+> [DOI: 10.61558/2993-074X.3622]
 
 ---
 
